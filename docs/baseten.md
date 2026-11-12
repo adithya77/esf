@@ -167,6 +167,69 @@ verified. The agent took 8.0 s, using 13,830 input tokens (6,656 cached) and
 955 output tokens: about $0.0033 at catalog prices, an estimate rather than an
 invoice. The agent ran as uid 10001.
 
+## Run ESF on this host
+
+### Install as services
+
+ESF runs as three systemd user services. With lingering enabled, they start at
+boot:
+
+| Unit | What it runs |
+|---|---|
+| `esf-temporal` | the Temporal stack (`docker compose up`, then waits until healthy) |
+| `esf-worker` | `factory worker` with `~/.config/esf/factory.toml` (restarts on failure) |
+| `esf-console` | the read-only console on `127.0.0.1:7331` (bearer token in `~/.config/esf/console.token`) |
+
+```sh
+loginctl enable-linger "$USER"          # once
+scripts/install-user-services.sh        # builds, installs ~/.local/share/esf/bin/factory, enables the units
+systemctl --user status esf-temporal esf-worker esf-console
+journalctl --user -u esf-worker -f      # worker log
+```
+
+The script never writes `factory.toml`. It refuses to run without it, and it
+creates the console token only if one is missing. Re-run it after pulling, to
+pick up a new binary.
+
+### Submit a task
+
+```sh
+F="$HOME/.local/share/esf/bin/factory --config $HOME/.config/esf/factory.toml"
+
+$F run --local-path ~/repos/fairground/space-1/space --rev "$(git -C ~/repos/fairground/space-1/space rev-parse HEAD)" \
+  --task 'Fix the typo in README.md' --agent pi --verification docs
+```
+
+The command prints the run ID and waits. With the review gate on, the run
+pauses after verification passes. Inspect it, then decide:
+
+```sh
+cat ~/.local/share/esf/data/runs/<run-id>/changes.patch
+$F review <run-id> --approve            # or --reject --note "what to change"
+```
+
+Evidence for every run is in `~/.local/share/esf/data/runs/<run-id>/`:
+
+| File | Contents |
+|---|---|
+| `changes.patch` | the change |
+| `run.json` | the manifest |
+| `verification/` | gate output |
+| `agent/usage.json` | tokens and estimated cost |
+| `preparation.json` | warm or cold, and timings |
+| `hardening/` | the egress probe, behaviour scan and gate integrity |
+
+The console at `http://127.0.0.1:7331` shows the same runs. Nothing is pushed
+anywhere; applying a patch is up to you.
+
+Useful checks:
+
+```sh
+$F doctor          # configuration, Baseten, Temporal, harnesses
+$F sandboxes       # live sandboxes; non-zero exit if a run leaked one
+$F status <run-id>
+```
+
 ## Egress policy mapping
 
 | Factory policy | Blaxel proxy |
