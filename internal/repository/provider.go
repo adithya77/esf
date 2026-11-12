@@ -3,8 +3,10 @@
 // Two source kinds are supported:
 //
 //   - SourceRemote clones a git URL. The URL must pass operator validation.
-//   - SourceLocal packs a repository that exists on the FACTORY HOST into a git
-//     bundle, pushes the bundle into the sandbox, and clones from it. This is
+//   - SourceLocal snapshots one commit of a repository on the FACTORY HOST:
+//     the requested revision and its tree, with no other refs and no history.
+//     The snapshot travels as a git bundle and keeps the commit's real SHA, so
+//     patches and evidence refer to the same revision as the host. This is
 //     how the end-to-end acceptance test runs entirely offline and without
 //     touching any real remote repository.
 //
@@ -22,11 +24,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +63,11 @@ type Request struct {
 	Revision string
 	// DestDir is the absolute in-sandbox directory to clone into.
 	DestDir string
+	// Shallow fetches only the requested revision of a remote repository
+	// (depth 1, no other refs, no submodules). Revision must then be a full
+	// commit SHA or a ref name the remote advertises. Local sources are
+	// always shallow.
+	Shallow bool
 }
 
 // Baseline records exactly what the agent started from.
@@ -70,14 +79,22 @@ type Baseline struct {
 	Branch         string            `json:"branch,omitempty"`
 	Status         string            `json:"status_porcelain"`
 	LockfileHashes map[string]string `json:"lockfile_hashes,omitempty"`
-	PreparedAt     time.Time         `json:"prepared_at"`
+	// Shallow records that only the baseline commit (no history) is present.
+	Shallow bool `json:"shallow,omitempty"`
+	// Credential names how a remote fetch authenticated, never the secret.
+	Credential string `json:"credential,omitempty"`
+	// SnapshotBytes is the size of the local snapshot moved into the sandbox.
+	SnapshotBytes int64     `json:"snapshot_bytes,omitempty"`
+	PreparedAt    time.Time `json:"prepared_at"`
 }
 
 // Provider prepares repositories.
 type Provider struct {
 	allowed    []string
 	localPaths []string
-	log        *slog.Logger
+	// maxSnapshotBytes bounds a local snapshot. Zero means DefaultMaxSnapshotBytes.
+	maxSnapshotBytes int64
+	log              *slog.Logger
 	// runHostCommand allows tests to replace host-side git invocation.
 	runHostCommand func(ctx context.Context, dir string, argv ...string) (string, error)
 }
@@ -90,6 +107,24 @@ type Option func(*Provider)
 // be controlled by the operator, not by task submitters.
 func WithLocalPaths(paths []string) Option {
 	return func(p *Provider) { p.localPaths = append([]string(nil), paths...) }
+}
+
+// DefaultMaxSnapshotBytes bounds a local repository snapshot when the
+// operator sets no limit. The snapshot is one commit and its tree, so this is
+// about the size of a fresh shallow clone.
+const DefaultMaxSnapshotBytes int64 = 1 << 30
+
+// ErrSnapshotTooLarge reports a local snapshot over the configured bound.
+var ErrSnapshotTooLarge = errors.New("repository: snapshot exceeds the size limit")
+
+// WithMaxSnapshotBytes bounds the local snapshot moved into a sandbox. Zero
+// or negative keeps the default.
+func WithMaxSnapshotBytes(n int64) Option {
+	return func(p *Provider) {
+		if n > 0 {
+			p.maxSnapshotBytes = n
+		}
+	}
 }
 
 // WithLogger sets the structured logger.
@@ -145,6 +180,10 @@ func (p *Provider) Prepare(ctx context.Context, sb sandbox.Sandbox, req Request)
 	if dest == "" {
 		dest = "/workspace/repository"
 	}
+	dest = path.Clean(dest)
+	if !path.IsAbs(dest) || path.Dir(dest) == dest {
+		return Baseline{}, fmt.Errorf("%w: repository directory %q must be an absolute path below /", ErrRepositoryRejected, req.DestDir)
+	}
 
 	switch req.Kind {
 	case SourceRemote:
@@ -157,8 +196,14 @@ func (p *Provider) Prepare(ctx context.Context, sb sandbox.Sandbox, req Request)
 }
 
 func (p *Provider) prepareRemote(ctx context.Context, sb sandbox.Sandbox, req Request, dest string) (Baseline, error) {
-	steps := []sandbox.Command{
-		{Argv: []string{"mkdir", "-p", path.Dir(dest)}, Description: "create workspace"},
+	if req.Shallow {
+		return p.prepareRemoteShallow(ctx, sb, req, dest)
+	}
+	reset, err := clearWorkspace(dest)
+	if err != nil {
+		return Baseline{}, err
+	}
+	steps := append(reset, []sandbox.Command{
 		{
 			// --no-tags and a single branch keep the clone small and fast, which
 			// matters because the base image has ~900 MiB of disk.
@@ -166,7 +211,8 @@ func (p *Provider) prepareRemote(ctx context.Context, sb sandbox.Sandbox, req Re
 			Timeout:     10 * time.Minute,
 			Description: "clone repository",
 		},
-	}
+		{Argv: []string{"git", "-C", dest, "config", preparedMarker, "true"}, Description: "mark repository"},
+	}...)
 	if err := runAll(ctx, sb, steps); err != nil {
 		return Baseline{}, err
 	}
@@ -175,7 +221,93 @@ func (p *Provider) prepareRemote(ctx context.Context, sb sandbox.Sandbox, req Re
 		Kind:         SourceRemote,
 		Source:       req.URL,
 		RequestedRev: req.Revision,
-	}, dest)
+	}, dest, req.Revision)
+}
+
+// prepareRemoteShallow fetches exactly the requested revision at depth 1.
+//
+// It makes the fewest, narrowest requests a clone can: one ref advertisement
+// and one upload-pack, both under the repository's own path. That is what
+// lets a proxy-injected credential be scoped to this repository alone.
+func (p *Provider) prepareRemoteShallow(ctx context.Context, sb sandbox.Sandbox, req Request, dest string) (Baseline, error) {
+	if strings.ContainsAny(req.Revision, ":+*^~ ") {
+		return Baseline{}, fmt.Errorf("%w: a shallow fetch needs a commit SHA or ref name, not %q", ErrRepositoryRejected, req.Revision)
+	}
+	// GitHub and other hosts serve SHA-1 repositories; a SHA-256 remote fails
+	// the fetch with git's own format error.
+	init, err := freshRepository(dest, "sha1")
+	if err != nil {
+		return Baseline{}, err
+	}
+	steps := append(init, []sandbox.Command{
+		{Argv: []string{"git", "-C", dest, "remote", "add", "origin", req.URL}, Description: "add remote"},
+		{
+			Argv:    []string{"git", "-C", dest, "fetch", "--depth", "1", "--no-tags", "--end-of-options", "origin", req.Revision + ":" + baselineRef},
+			Timeout: 10 * time.Minute,
+			// Authentication happens at the proxy; git must fail on a 401,
+			// never wait for a username.
+			Env:         map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+			Description: "fetch revision",
+		},
+	}...)
+	if err := runAll(ctx, sb, steps); err != nil {
+		return Baseline{}, err
+	}
+	return p.checkout(ctx, sb, Baseline{
+		Kind:         SourceRemote,
+		Source:       req.URL,
+		RequestedRev: req.Revision,
+		Shallow:      true,
+	}, dest, baselineRef)
+}
+
+// baselineRef holds the fetched baseline in the sandbox repository.
+const baselineRef = "refs/esf/base"
+
+// preparedMarker is set in repositories this package initialises, so a retry
+// may replace one it made itself and never anything else.
+const preparedMarker = "esf.prepared"
+
+// clearWorkspace makes dest an empty directory.
+//
+// dest comes from the run request, so it is never removed blindly: a
+// directory is replaced only when it is a repository this package created
+// (a retried preparation); an existing non-empty directory is refused, as
+// `git clone` refuses it.
+func clearWorkspace(dest string) ([]sandbox.Command, error) {
+	if !strings.HasPrefix(dest, "/") {
+		return nil, fmt.Errorf("repository: destination %q must be absolute", dest)
+	}
+	quoted, err := sandbox.QuoteArgv([]string{dest})
+	if err != nil {
+		return nil, err
+	}
+	script := "d=" + quoted + "\n" +
+		"if [ -e \"$d\" ]; then\n" +
+		"  if [ -d \"$d/.git\" ] && [ \"$(git --git-dir=\"$d/.git\" config --get " + preparedMarker + " 2>/dev/null)\" = true ]; then\n" +
+		"    rm -rf -- \"$d\"\n" +
+		"  elif [ -n \"$(ls -A -- \"$d\" 2>/dev/null)\" ]; then\n" +
+		"    echo \"destination $d already exists and is not empty\" >&2; exit 1\n" +
+		"  fi\n" +
+		"fi\n" +
+		"mkdir -p -- \"$d\"\n"
+	return []sandbox.Command{{Script: script, Description: "clear workspace"}}, nil
+}
+
+// freshRepository makes dest an empty, marked repository of the given object
+// format.
+func freshRepository(dest, objectFormat string) ([]sandbox.Command, error) {
+	if objectFormat != "sha1" && objectFormat != "sha256" {
+		return nil, fmt.Errorf("repository: unsupported object format %q", objectFormat)
+	}
+	steps, err := clearWorkspace(dest)
+	if err != nil {
+		return nil, err
+	}
+	return append(steps,
+		sandbox.Command{Argv: []string{"git", "init", "-q", "--object-format=" + objectFormat, dest}, Description: "initialise repository"},
+		sandbox.Command{Argv: []string{"git", "-C", dest, "config", preparedMarker, "true"}, Description: "mark repository"},
+	), nil
 }
 
 func (p *Provider) prepareLocal(ctx context.Context, sb sandbox.Sandbox, req Request, dest string) (Baseline, error) {
@@ -196,58 +328,189 @@ func (p *Provider) prepareLocal(ctx context.Context, sb sandbox.Sandbox, req Req
 		return Baseline{}, err
 	}
 
-	// Pack on the host. `git bundle` is a transport, not a code path: it reads
-	// objects and writes a file.
-	bundlePath, err := os.CreateTemp("", "factory-repo-*.bundle")
+	snapshot, err := p.snapshotLocal(ctx, req)
 	if err != nil {
-		return Baseline{}, fmt.Errorf("repository: create temporary bundle: %w", err)
-	}
-	bundleName := bundlePath.Name()
-	if err := bundlePath.Close(); err != nil {
 		return Baseline{}, err
 	}
-	defer os.Remove(bundleName)
+	defer snapshot.cleanup()
 
-	if _, err := p.runHostCommand(ctx, req.LocalPath, "bundle", "create", bundleName, "--all"); err != nil {
-		return Baseline{}, fmt.Errorf("repository: bundle local repository: %w", err)
+	// A fixed scratch location, independent of the request's repository
+	// directory, so the bundle can never land inside the destination.
+	bundle := "/tmp/esf-snapshot-" + snapshot.sha[:16] + ".bundle"
+	if err := writeSnapshot(ctx, sb, bundle, snapshot); err != nil {
+		return Baseline{}, fmt.Errorf("repository: push snapshot into sandbox: %w", err)
 	}
-	bundleBytes, err := os.ReadFile(bundleName)
+
+	steps, err := freshRepository(dest, snapshot.objectFormat)
 	if err != nil {
-		return Baseline{}, fmt.Errorf("repository: read bundle: %w", err)
+		return Baseline{}, err
 	}
-
-	const sandboxBundle = "/workspace/.factory/repository.bundle"
-	if err := sb.WriteFile(ctx, sandboxBundle, bundleBytes); err != nil {
-		return Baseline{}, fmt.Errorf("repository: push bundle into sandbox: %w", err)
+	if err := runAll(ctx, sb, steps); err != nil {
+		return Baseline{}, err
 	}
-
-	steps := []sandbox.Command{
-		{Argv: []string{"mkdir", "-p", path.Dir(dest)}, Description: "create workspace"},
+	// The snapshot holds one commit without its parents. Declaring the
+	// commit shallow first is what lets git accept it.
+	if err := sb.WriteFile(ctx, path.Join(dest, ".git", "shallow"), []byte(snapshot.sha+"\n")); err != nil {
+		return Baseline{}, fmt.Errorf("repository: mark snapshot shallow: %w", err)
+	}
+	steps = []sandbox.Command{
 		{
-			Argv:        []string{"git", "clone", "--no-tags", sandboxBundle, dest},
+			Argv:        []string{"git", "-C", dest, "fetch", "-q", "--no-tags", bundle, snapshotRef + ":" + baselineRef},
 			Timeout:     5 * time.Minute,
-			Description: "clone from bundle",
+			Description: "unpack snapshot",
 		},
-		{
-			// The bundle remote is a temporary artifact; drop it so the agent
-			// cannot accidentally fetch or push through it.
-			Argv:        []string{"git", "-C", dest, "remote", "remove", "origin"},
-			Description: "remove bundle remote",
-		},
+		{Argv: []string{"rm", "-f", "--", bundle}, Description: "remove snapshot bundle"},
 	}
 	if err := runAll(ctx, sb, steps); err != nil {
 		return Baseline{}, err
 	}
 
 	return p.checkout(ctx, sb, Baseline{
-		Kind:         SourceLocal,
-		Source:       "local:" + req.LocalPath,
-		RequestedRev: req.Revision,
-	}, dest)
+		Kind:          SourceLocal,
+		Source:        "local:" + req.LocalPath,
+		RequestedRev:  req.Revision,
+		Shallow:       true,
+		SnapshotBytes: snapshot.size,
+	}, dest, snapshot.sha)
+}
+
+// snapshotRef names the commit inside a snapshot bundle.
+const snapshotRef = "refs/heads/esf-snapshot"
+
+type localSnapshot struct {
+	file         string
+	sha          string
+	objectFormat string
+	size         int64
+	cleanup      func()
+}
+
+// snapshotLocal bundles exactly one commit of a host repository: the
+// requested revision and its tree, without parents, other refs, or tags.
+//
+// A bundle cannot be cut from a deep repository without its history, so the
+// commit is first fetched at depth 1 into a scratch repository. The host
+// repository is only read (through git upload-pack); nothing is written to it.
+func (p *Provider) snapshotLocal(ctx context.Context, req Request) (localSnapshot, error) {
+	resolved, err := p.runHostCommand(ctx, req.LocalPath, append([]string{"rev-parse", "--verify", "--quiet"}, revisionArgs(req.Revision)...)...)
+	if err != nil {
+		return localSnapshot{}, fmt.Errorf("%w: revision %q does not name a commit in %s", ErrRepositoryRejected, req.Revision, req.LocalPath)
+	}
+	sha := strings.TrimSpace(resolved)
+	format, err := p.runHostCommand(ctx, req.LocalPath, "rev-parse", "--show-object-format")
+	if err != nil {
+		return localSnapshot{}, fmt.Errorf("repository: read object format: %w", err)
+	}
+	format = strings.TrimSpace(format)
+	limit := p.maxSnapshotBytes
+	if limit <= 0 {
+		limit = DefaultMaxSnapshotBytes
+	}
+	// Estimate before writing anything to the host's temp space: the stored
+	// size of the commit's tree is close to the bundle's, and a tree far over
+	// the limit must not fill the disk on the way to being rejected.
+	usage, err := p.runHostCommand(ctx, req.LocalPath, "rev-list", "--objects", "--no-walk", "--disk-usage", sha)
+	n, perr := strconv.ParseInt(strings.TrimSpace(usage), 10, 64)
+	switch {
+	case err != nil || perr != nil:
+		// git before 2.38 has no --disk-usage. The bound still holds below,
+		// but only after the snapshot is written to temporary storage.
+		p.log.WarnContext(ctx, "local snapshot size could not be estimated before writing; host git may predate 2.38",
+			slog.String("repository", req.LocalPath))
+	case n > limit:
+		return localSnapshot{}, fmt.Errorf("%w: %s at %s holds about %s, over repositories.max_snapshot_bytes (%s)",
+			ErrSnapshotTooLarge, req.LocalPath, sha[:12], humanBytes(n), humanBytes(limit))
+	}
+
+	scratch, err := os.MkdirTemp("", "factory-snapshot-*")
+	if err != nil {
+		return localSnapshot{}, fmt.Errorf("repository: create snapshot directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(scratch) }
+	repo := filepath.Join(scratch, "repo")
+	file := filepath.Join(scratch, "snapshot.bundle")
+	// allowAnySHA1InWant applies to this one upload-pack process only; it lets
+	// a commit be requested by SHA without changing the host repository.
+	steps := [][]string{
+		{"init", "-q", "--bare", "--object-format=" + format, repo},
+		{"-C", repo, "fetch", "-q", "--depth", "1", "--no-tags",
+			"--upload-pack", "git -c uploadpack.allowAnySHA1InWant=true upload-pack",
+			req.LocalPath, sha + ":" + snapshotRef},
+		{"-C", repo, "bundle", "create", "-q", file, snapshotRef},
+	}
+	for _, args := range steps {
+		if _, err := p.runHostCommand(ctx, scratch, args...); err != nil {
+			cleanup()
+			return localSnapshot{}, fmt.Errorf("repository: snapshot local repository: %w", err)
+		}
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		cleanup()
+		return localSnapshot{}, fmt.Errorf("repository: read snapshot: %w", err)
+	}
+	if info.Size() > limit {
+		cleanup()
+		return localSnapshot{}, fmt.Errorf("%w: %s at %s is %s, over repositories.max_snapshot_bytes (%s)",
+			ErrSnapshotTooLarge, req.LocalPath, sha[:12], humanBytes(info.Size()), humanBytes(limit))
+	}
+	p.log.InfoContext(ctx, "local repository snapshot",
+		slog.String("repository.sha", sha), slog.Int64("snapshot.bytes", info.Size()))
+	return localSnapshot{file: file, sha: sha, objectFormat: format, size: info.Size(), cleanup: cleanup}, nil
+}
+
+// writeSnapshot streams the snapshot when the provider can, so a large one
+// never has to fit in the worker's memory; otherwise it is read once, already
+// bounded by the size limit.
+func writeSnapshot(ctx context.Context, sb sandbox.Sandbox, dest string, snap localSnapshot) error {
+	f, err := os.Open(snap.file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if streamer, ok := sb.(sandbox.FileStreamer); ok {
+		return streamer.WriteFileFrom(ctx, dest, f, snap.size)
+	}
+	// Without streaming, the snapshot goes in bounded parts that are joined
+	// inside the sandbox, so worker memory never holds more than one part.
+	chunk := make([]byte, snapshotPartBytes)
+	var parts []string
+	for offset, i := int64(0), 0; offset < snap.size; offset, i = offset+snapshotPartBytes, i+1 {
+		n := min(snapshotPartBytes, snap.size-offset)
+		if _, err := io.ReadFull(f, chunk[:n]); err != nil {
+			return fmt.Errorf("read snapshot: %w", err)
+		}
+		part := fmt.Sprintf("%s.part-%06d", dest, i)
+		if err := sb.WriteFile(ctx, part, chunk[:n]); err != nil {
+			return err
+		}
+		parts = append(parts, part)
+	}
+	if len(parts) == 1 {
+		return runAll(ctx, sb, []sandbox.Command{{Argv: []string{"mv", "-f", "--", parts[0], dest}, Description: "place snapshot"}})
+	}
+	argv := append([]string{"sh", "-c", `out="$1"; shift; cat -- "$@" > "$out" && rm -f -- "$@"`, "join-snapshot", dest}, parts...)
+	return runAll(ctx, sb, []sandbox.Command{{Argv: argv, Timeout: 5 * time.Minute, Description: "join snapshot parts"}})
+}
+
+// snapshotPartBytes bounds one write when the provider cannot stream. A
+// variable only so tests can force several parts.
+var snapshotPartBytes int64 = 8 << 20
+
+func humanBytes(n int64) string {
+	const mib = 1 << 20
+	if n >= mib {
+		return fmt.Sprintf("%.1f MiB", float64(n)/mib)
+	}
+	return fmt.Sprintf("%d bytes", n)
 }
 
 // checkout checks out the exact revision and records the baseline.
-func (p *Provider) checkout(ctx context.Context, sb sandbox.Sandbox, base Baseline, dest string) (Baseline, error) {
+//
+// resolve is what names the revision inside the sandbox: the requested
+// revision for a full clone, the fetched baseline ref or snapshot SHA
+// otherwise. base.RequestedRev keeps the caller's spelling for evidence.
+func (p *Provider) checkout(ctx context.Context, sb sandbox.Sandbox, base Baseline, dest, resolve string) (Baseline, error) {
 	// Identity is set inside the sandbox so the agent can commit if it needs to.
 	identity := []sandbox.Command{
 		{Argv: []string{"git", "-C", dest, "config", "user.email", "factory@localhost"}, Description: "git identity email"},
@@ -260,7 +523,7 @@ func (p *Provider) checkout(ctx context.Context, sb sandbox.Sandbox, base Baseli
 
 	// Resolve the requested revision to a full SHA first so the recorded
 	// baseline is unambiguous and the checkout is pinned.
-	rev, err := runOne(ctx, sb, dest, append([]string{"rev-parse"}, revisionArgs(base.RequestedRev)...)...)
+	rev, err := runOne(ctx, sb, dest, append([]string{"rev-parse"}, revisionArgs(resolve)...)...)
 	if err != nil {
 		return Baseline{}, err
 	}

@@ -637,3 +637,62 @@ func TestNetworkInEffectIgnoresOrderAndDuplicates(t *testing.T) {
 		t.Fatal("a widened policy was accepted")
 	}
 }
+
+// The factory's repository-clone policy: two path rules on github.com sharing
+// one Basic credential. They must collapse into one route, and the allowlist
+// must admit only that repository's smart-HTTP paths.
+func TestGitHubClonePolicyTranslation(t *testing.T) {
+	f := newFake(t)
+	p := f.provider(t)
+	sb, err := p.Create(ctxT(t), sandbox.Spec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deny := false
+	rule := func(method, path string) sandbox.NetworkRule {
+		return sandbox.NetworkRule{
+			Name:   "factory-repository-clone",
+			Match:  sandbox.NetworkMatch{Scheme: "https", Host: "github.com", SNI: "github.com", Method: []string{method}, Path: path},
+			Action: sandbox.NetworkAction{Allow: true, Inject: []sandbox.HeaderInjection{{Header: "Authorization", Secret: "eC1hY2Nlc3MtdG9rZW46dA==", Format: "Basic ${SECRET}"}}},
+		}
+	}
+	if err := sb.(sandbox.NetworkUpdater).UpdateNetwork(ctxT(t), sandbox.Network{AllowInternet: &deny, Rules: []sandbox.NetworkRule{
+		rule("GET", "/acme/service/info/refs"), rule("POST", "/acme/service/git-upload-pack"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	proxy := f.body("PUT /v0/sandboxes/" + sb.ID())["spec"].(map[string]any)["network"].(map[string]any)["proxy"].(map[string]any)
+	allowed := proxy["allowedDomains"].([]any)
+	if len(allowed) != 2 || allowed[0] != "GET:github.com/acme/service/info/refs" || allowed[1] != "POST:github.com/acme/service/git-upload-pack" {
+		t.Fatalf("allowlist = %v", allowed)
+	}
+	routes := proxy["routing"].([]any)
+	if len(routes) != 1 || routes[0].(map[string]any)["headers"].(map[string]any)["Authorization"] != "Basic {{SECRET:esf-secret-0}}" {
+		t.Fatalf("routes = %v", routes)
+	}
+	// Restoring an open run policy drops the route and the secret.
+	if err := sb.(sandbox.NetworkUpdater).UpdateNetwork(ctxT(t), sandbox.Network{}); err != nil {
+		t.Fatal(err)
+	}
+	restored := f.body("PUT /v0/sandboxes/" + sb.ID())["spec"].(map[string]any)["network"].(map[string]any)["proxy"].(map[string]any)
+	if _, ok := restored["routing"]; ok {
+		t.Fatalf("route survived the restore: %v", restored)
+	}
+}
+
+func TestWriteFileFromStreamsInParts(t *testing.T) {
+	f := newFake(t)
+	p := f.provider(t)
+	sb, _ := p.Create(ctxT(t), sandbox.Spec{})
+	data := bytes.Repeat([]byte{1, 2, 3}, (singleUploadBytes*2+10)/3)
+	if err := sb.(sandbox.FileStreamer).WriteFileFrom(ctxT(t), "/srv/s.bundle", bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(f.files["/srv/s.bundle"], data) || len(f.uploads["up0"]) != 3 {
+		t.Fatalf("streamed %d bytes in %d parts", len(f.files["/srv/s.bundle"]), len(f.uploads["up0"]))
+	}
+	// A short source is an error, never a truncated file.
+	if err := sb.(sandbox.FileStreamer).WriteFileFrom(ctxT(t), "/srv/t.bundle", bytes.NewReader(data[:100]), int64(len(data))); err == nil {
+		t.Fatal("short source accepted")
+	}
+}

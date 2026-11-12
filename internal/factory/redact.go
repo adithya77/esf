@@ -2,8 +2,10 @@ package factory
 
 import (
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // RedactionMask replaces a scrubbed value. It keeps evidence readable while
@@ -92,6 +94,9 @@ func RedactionRuleNames() []string {
 // nil-safe so callers never need to branch on whether redaction is configured.
 type Redactor struct {
 	// values are exact secret strings registered by the operator at startup.
+	// mu guards values: activities register credentials while other runs on
+	// the same worker are redacting.
+	mu     sync.RWMutex
 	values []string
 }
 
@@ -111,9 +116,11 @@ func (r *Redactor) Add(secrets ...string) {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, secret := range secrets {
 		trimmed := strings.TrimSpace(secret)
-		if len(trimmed) < 4 {
+		if len(trimmed) < 4 || slices.Contains(r.values, trimmed) {
 			continue
 		}
 		r.values = append(r.values, trimmed)
@@ -128,6 +135,8 @@ func (r *Redactor) ValueCount() int {
 	if r == nil {
 		return 0
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.values)
 }
 
@@ -138,11 +147,13 @@ func (r *Redactor) Redact(text string) string {
 		return ""
 	}
 	if r != nil {
+		r.mu.RLock()
 		for _, value := range r.values {
 			if strings.Contains(text, value) {
 				text = strings.ReplaceAll(text, value, RedactionMask)
 			}
 		}
+		r.mu.RUnlock()
 	}
 	for _, rule := range redactionRules {
 		text = rule.pattern.ReplaceAllString(text, rule.replace)

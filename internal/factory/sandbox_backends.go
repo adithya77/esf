@@ -34,6 +34,9 @@ type sandboxBackend struct {
 	productionCheck func(Config) (string, error)
 	// pingSummary describes what a successful Ping proved.
 	pingSummary func(Config) string
+	// networkControl reports that sandboxes implement sandbox.NetworkUpdater
+	// with proxy-side credential injection.
+	networkControl bool
 }
 
 var sandboxBackends = map[string]sandboxBackend{
@@ -65,7 +68,8 @@ var sandboxBackends = map[string]sandboxBackend{
 			}
 			return "cube_data_tls", nil
 		},
-		pingSummary: func(c Config) string { return "template " + c.Cube.TemplateID + " exists" },
+		pingSummary:    func(c Config) string { return "template " + c.Cube.TemplateID + " exists" },
+		networkControl: true,
 	},
 	baseten.ProviderName: {
 		validate:        func(c Config) error { return c.Baseten.Validate() },
@@ -103,6 +107,7 @@ var sandboxBackends = map[string]sandboxBackend{
 			// The image is pulled at create time; Ping cannot check it.
 			return "region " + c.Baseten.Region + " has the egress proxy, template " + c.Baseten.Template
 		},
+		networkControl: true,
 	},
 }
 

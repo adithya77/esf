@@ -166,6 +166,15 @@ type RepositoriesConfig struct {
 	// LocalPaths registers exact canonical host repository directories. Empty
 	// disables local sources; this never grants descendant or prefix access.
 	LocalPaths []string `toml:"local_paths"`
+	// MaxSnapshotBytes bounds the one-commit snapshot of a local repository
+	// moved into a sandbox. Zero means 1 GiB.
+	MaxSnapshotBytes int64 `toml:"max_snapshot_bytes"`
+	// GitHubTokenFile is an absolute, owner-only file holding a read-only
+	// GitHub token for cloning allowed https://github.com repositories. The
+	// sandbox provider's egress proxy injects it during repository preparation
+	// only; it never enters the sandbox, and it is withdrawn before any
+	// repository or agent code runs.
+	GitHubTokenFile string `toml:"github_token_file"`
 }
 
 // ObservabilityConfig configures trace export.
@@ -385,6 +394,37 @@ func (c Config) Validate() error {
 	var problems []string
 	if err := repository.ValidateLocalPaths(c.Repositories.LocalPaths); err != nil {
 		problems = append(problems, "repositories.local_paths: "+err.Error())
+	}
+	if c.Repositories.MaxSnapshotBytes < 0 {
+		problems = append(problems, "repositories.max_snapshot_bytes must not be negative")
+	}
+	if f := strings.TrimSpace(c.Repositories.GitHubTokenFile); f != "" {
+		if !filepath.IsAbs(f) {
+			problems = append(problems, "repositories.github_token_file must be an absolute path")
+		}
+		if !backend.networkControl {
+			problems = append(problems, fmt.Sprintf("repositories.github_token_file needs a sandbox provider with egress credential injection; %s has none", c.SandboxProvider()))
+		}
+		// The token travels to the provider's control plane like a
+		// cube_egress credential, under the same transport rule.
+		if err := validateCredentialControlPlane(c.sandboxControlPlaneURL()); err != nil {
+			problems = append(problems, "repositories.github_token_file: "+err.Error())
+		}
+		// A credentialed clone restores the run's egress policy afterwards,
+		// so every policy a run can resolve must be stated, not "the
+		// deployment default".
+		for name, policy := range c.Egress {
+			if policy.AllowInternet == nil {
+				problems = append(problems, fmt.Sprintf("repositories.github_token_file: egress policy %q must set allow_internet", name))
+			}
+		}
+		if c.Hardening.AcknowledgeOpenEgress {
+			for name, scope := range c.Scopes {
+				if strings.TrimSpace(scope.Egress) == "" {
+					problems = append(problems, fmt.Sprintf("repositories.github_token_file: scope %q must name an egress policy (open egress is acknowledged, so it would otherwise run under the unstated deployment default)", name))
+				}
+			}
+		}
 	}
 	if c.SchemaVersion != 0 && c.SchemaVersion != ConfigSchemaVersion {
 		problems = append(problems, fmt.Sprintf("unsupported configuration schema_version %d (supported: %d)", c.SchemaVersion, ConfigSchemaVersion))

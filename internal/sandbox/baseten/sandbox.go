@@ -217,13 +217,37 @@ func (s *basetenSandbox) WriteFile(ctx context.Context, path string, data []byte
 		}
 		return nil
 	}
-	if err := s.writeMultipart(ctx, target, data); err != nil {
+	if err := s.writeMultipart(ctx, target, bytes.NewReader(data), int64(len(data))); err != nil {
 		return fmt.Errorf("write %s in sandbox %s: %w", path, s.id, err)
 	}
 	return nil
 }
 
-func (s *basetenSandbox) writeMultipart(ctx context.Context, target string, data []byte) error {
+// WriteFileFrom streams size bytes from r into the sandbox. At most one
+// upload part (5 MiB) is held in memory, so a large repository snapshot does
+// not have to fit in the worker's heap.
+func (s *basetenSandbox) WriteFileFrom(ctx context.Context, path string, r io.Reader, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("write file: negative size")
+	}
+	if size <= singleUploadBytes {
+		data := make([]byte, size)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return fmt.Errorf("write %s in sandbox %s: read source: %w", path, s.id, err)
+		}
+		return s.WriteFile(ctx, path, data)
+	}
+	target, err := filePath(path)
+	if err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+	if err := s.writeMultipart(ctx, target, r, size); err != nil {
+		return fmt.Errorf("write %s in sandbox %s: %w", path, s.id, err)
+	}
+	return nil
+}
+
+func (s *basetenSandbox) writeMultipart(ctx context.Context, target string, r io.Reader, size int64) error {
 	api := s.provider.api
 	var initiated struct {
 		UploadID string `json:"uploadId"`
@@ -249,9 +273,13 @@ func (s *basetenSandbox) writeMultipart(ctx context.Context, target string, data
 		PartNumber int    `json:"partNumber"`
 	}
 	var parts []part
-	for offset, number := 0, 1; offset < len(data); offset, number = offset+singleUploadBytes, number+1 {
-		end := min(offset+singleUploadBytes, len(data))
-		form, contentType, err := fileForm(data[offset:end], nil)
+	chunk := make([]byte, singleUploadBytes)
+	for offset, number := int64(0), 1; offset < size; offset, number = offset+singleUploadBytes, number+1 {
+		n := min(int64(singleUploadBytes), size-offset)
+		if _, err := io.ReadFull(r, chunk[:n]); err != nil {
+			return fmt.Errorf("read source at byte %d: %w", offset, err)
+		}
+		form, contentType, err := fileForm(chunk[:n], nil)
 		if err != nil {
 			return err
 		}

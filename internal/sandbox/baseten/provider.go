@@ -571,6 +571,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 var (
-	_ sandbox.Provider = (*Provider)(nil)
-	_ sandbox.Sandbox  = (*basetenSandbox)(nil)
+	_ sandbox.Provider     = (*Provider)(nil)
+	_ sandbox.Sandbox      = (*basetenSandbox)(nil)
+	_ sandbox.FileStreamer = (*basetenSandbox)(nil)
 )
