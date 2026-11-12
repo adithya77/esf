@@ -235,6 +235,15 @@ type FileStreamer interface {
 	WriteFileFrom(ctx context.Context, path string, r io.Reader, size int64) error
 }
 
+// Adopter is implemented by providers that can hand a live sandbox to a new
+// owner: replace its metadata and its idle timeout. The warm pool relies on
+// it, so a pre-built sandbox carries the run's ownership (for leak detection
+// and retry recovery) and the run's idle timeout, exactly like a sandbox the
+// run created.
+type Adopter interface {
+	Adopt(ctx context.Context, sandboxID string, metadata map[string]string, idleTimeout time.Duration) error
+}
+
 // NetworkUpdater is implemented by providers that can atomically replace a
 // running sandbox's egress policy. The factory uses it to allow setup traffic
 // first, then lock the agent phase down before untrusted execution begins.

@@ -696,3 +696,29 @@ func TestWriteFileFromStreamsInParts(t *testing.T) {
 		t.Fatal("short source accepted")
 	}
 }
+
+func TestAdoptRelabelsAndResetsIdleTimeout(t *testing.T) {
+	f := newFake(t)
+	p := f.provider(t)
+	sb, err := p.Create(ctxT(t), sandbox.Spec{Metadata: map[string]string{"origin": "factory-pool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]string{"origin": "factory", "run_id": "run-1"}
+	if err := p.Adopt(ctxT(t), sb.ID(), labels, 45*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	put := f.body("PUT /v0/sandboxes/" + sb.ID())
+	got := put["metadata"].(map[string]any)["labels"].(map[string]any)
+	if got["origin"] != "factory" || got["run_id"] != "run-1" || len(got) != 2 {
+		t.Fatalf("labels = %v", got)
+	}
+	policy := put["spec"].(map[string]any)["lifecycle"].(map[string]any)["expirationPolicies"].([]any)[0].(map[string]any)
+	if policy["value"] != "2700s" || policy["type"] != "ttl-idle" {
+		t.Fatalf("lifecycle = %v", policy)
+	}
+	// The network block is untouched by adoption.
+	if put["spec"].(map[string]any)["network"] == nil {
+		t.Fatal("adoption dropped the network block")
+	}
+}

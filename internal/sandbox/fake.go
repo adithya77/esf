@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -223,6 +224,21 @@ func (f *Fake) List(context.Context) ([]Info, error) {
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
 	return infos, nil
+}
+
+// Adopt replaces a live sandbox's metadata and idle timeout, like a provider
+// that supports adoption.
+func (f *Fake) Adopt(_ context.Context, sandboxID string, metadata map[string]string, idleTimeout time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.live[sandboxID]; !ok {
+		return fmt.Errorf("fake: sandbox %s not found", sandboxID)
+	}
+	spec := f.specs[sandboxID]
+	spec.Metadata = maps.Clone(metadata)
+	spec.IdleTimeout = idleTimeout
+	f.specs[sandboxID] = spec
+	return nil
 }
 
 // Live returns the IDs of sandboxes still alive. Tests use it to assert that

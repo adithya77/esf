@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -225,12 +226,10 @@ func (p *Provider) Create(ctx context.Context, spec sandbox.Spec) (sandbox.Sandb
 	body := map[string]any{
 		"metadata": map[string]any{"name": name, "labels": spec.Metadata},
 		"spec": map[string]any{
-			"region":  p.cfg.Region,
-			"runtime": runtime,
-			"lifecycle": map[string]any{"expirationPolicies": []map[string]string{{
-				"type": "ttl-idle", "value": strconv.Itoa(int(idle/time.Second)) + "s", "action": "delete",
-			}}},
-			"network": network,
+			"region":    p.cfg.Region,
+			"runtime":   runtime,
+			"lifecycle": idleLifecycle(idle),
+			"network":   network,
 		},
 	}
 
@@ -449,6 +448,47 @@ func (p *Provider) sandboxURL(name string) string {
 	return p.api.controlPlane + "/sandboxes/" + url.PathEscape(name)
 }
 
+// Adopt replaces a sandbox's labels and idle-delete policy and reads the
+// labels back. Labels are ownership: a mismatch is an error, never a partial
+// success.
+func (p *Provider) Adopt(ctx context.Context, sandboxID string, metadata map[string]string, idleTimeout time.Duration) error {
+	var current struct {
+		Metadata map[string]any `json:"metadata"`
+		Spec     map[string]any `json:"spec"`
+	}
+	if err := p.api.doJSON(ctx, request{Method: http.MethodGet, URL: p.sandboxURL(sandboxID), Op: "get sandbox"}, nil, &current); err != nil {
+		return fmt.Errorf("adopt sandbox %s: %w", sandboxID, classify(err))
+	}
+	if current.Metadata == nil || current.Spec == nil {
+		return fmt.Errorf("%w: sandbox %s has no metadata", ErrUnavailable, sandboxID)
+	}
+	current.Metadata["labels"] = metadata
+	// The same rule as Create: no requested timeout means the configured one.
+	if idleTimeout <= 0 {
+		idleTimeout = p.cfg.IdleTimeout.Std()
+	}
+	current.Spec["lifecycle"] = idleLifecycle(max(idleTimeout, minIdleTimeout))
+	if err := p.api.doJSON(ctx, request{Method: http.MethodPut, URL: p.sandboxURL(sandboxID), Op: "adopt sandbox"},
+		map[string]any{"metadata": current.Metadata, "spec": current.Spec}, nil); err != nil {
+		return fmt.Errorf("adopt sandbox %s: %w", sandboxID, classify(err))
+	}
+	res, err := p.get(ctx, sandboxID)
+	if err != nil {
+		return fmt.Errorf("read back sandbox %s: %w", sandboxID, err)
+	}
+	if !maps.Equal(res.Metadata.Labels, metadata) {
+		return fmt.Errorf("%w: sandbox %s does not report the requested metadata", ErrUnavailable, sandboxID)
+	}
+	return nil
+}
+
+// idleLifecycle is the ttl-idle delete policy used at create and adoption.
+func idleLifecycle(idle time.Duration) map[string]any {
+	return map[string]any{"expirationPolicies": []map[string]string{{
+		"type": "ttl-idle", "value": strconv.Itoa(int(idle/time.Second)) + "s", "action": "delete",
+	}}}
+}
+
 // updateNetwork replaces a live sandbox's network block and reads it back.
 // The firewall cannot change after creation, so a sandbox without it is
 // refused instead of being given an allowlist it would not enforce.
@@ -574,4 +614,5 @@ var (
 	_ sandbox.Provider     = (*Provider)(nil)
 	_ sandbox.Sandbox      = (*basetenSandbox)(nil)
 	_ sandbox.FileStreamer = (*basetenSandbox)(nil)
+	_ sandbox.Adopter      = (*Provider)(nil)
 )

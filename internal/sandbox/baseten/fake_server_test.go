@@ -277,6 +277,9 @@ func (f *fakeBaseten) sandbox(w http.ResponseWriter, r *http.Request, name strin
 		var req map[string]any
 		_ = json.Unmarshal(body, &req)
 		sb["spec"] = req["spec"]
+		if meta, ok := req["metadata"].(map[string]any); ok {
+			sb["metadata"] = meta
+		}
 		writeJSON(w, 200, sb)
 	}
 }
