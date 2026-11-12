@@ -2,6 +2,7 @@ package factory
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,5 +207,26 @@ func TestJSONEvidenceRedactionPreservesEncoding(t *testing.T) {
 	}
 	if got.Count != 9007199254740993 {
 		t.Fatalf("integer precision lost: %d", got.Count)
+	}
+}
+
+func TestRedactorIsSafeForConcurrentUse(t *testing.T) {
+	r := NewRedactor("initial-secret")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			r.Add("added-secret-value", fmt.Sprintf("secret-%04d", i))
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		_ = r.Redact("text with added-secret-value and initial-secret")
+	}
+	<-done
+	if got := r.Redact("added-secret-value"); got != RedactionMask {
+		t.Fatalf("redacted = %q", got)
+	}
+	if n := r.ValueCount(); n != 202 {
+		t.Fatalf("values = %d, want 202 (duplicates are not re-added)", n)
 	}
 }
