@@ -11,6 +11,7 @@ package sandbox
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -223,6 +224,15 @@ type Snapshotter interface {
 	Snapshot(ctx context.Context, sandboxID, name string) (string, error)
 	Clone(ctx context.Context, sandboxID, snapshotID string, n int) ([]Sandbox, error)
 	Rollback(ctx context.Context, sandboxID, snapshotID string) error
+}
+
+// FileStreamer is implemented by providers that can write a file from a
+// reader without holding the whole payload in memory. Callers moving large
+// artifacts (a repository snapshot) prefer it and fall back to WriteFile.
+type FileStreamer interface {
+	// WriteFileFrom writes exactly size bytes from r to path, creating parent
+	// directories. It fails if r yields fewer bytes.
+	WriteFileFrom(ctx context.Context, path string, r io.Reader, size int64) error
 }
 
 // NetworkUpdater is implemented by providers that can atomically replace a
