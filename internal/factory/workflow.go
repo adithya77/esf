@@ -399,6 +399,7 @@ func (s *workflowState) run(ctx workflow.Context, acts *Activities, req RunReque
 		RunID:     req.RunID,
 		SandboxID: s.sandboxID,
 		Request:   req,
+		Network:   s.resources.Egress,
 	}).Get(ctx, &preparedRepo); err != nil {
 		s.status.State = StateInfrastructureFailed
 		s.setCondition(ctx, ConditionRepositoryPrepared, ConditionFalse, "PrepareFailed", err.Error())

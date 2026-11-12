@@ -279,6 +279,9 @@ type PrepareRepositoryInput struct {
 	RunID     string     `json:"run_id"`
 	SandboxID string     `json:"sandbox_id"`
 	Request   RunRequest `json:"request"`
+	// Network is the run's sandbox egress policy. A credentialed clone
+	// replaces it for the fetch and restores it afterwards.
+	Network sandbox.Network `json:"network,omitempty"`
 }
 
 // PrepareRepositoryOutput records the baseline.
@@ -766,13 +769,19 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 			kind = string(repository.SourceRemote)
 		}
 	}
-	baseline, err := a.repos.Prepare(ctx, sb, repository.Request{
+	req := repository.Request{
 		Kind:      repository.Kind(kind),
 		URL:       in.Request.Repository,
 		LocalPath: in.Request.LocalPath,
 		Revision:  in.Request.Revision,
 		DestDir:   in.Request.EffectiveRepositoryDir(),
-	})
+	}
+	var baseline repository.Baseline
+	if req.Kind == repository.SourceRemote {
+		baseline, err = a.prepareRemoteRepository(ctx, sb, req, in.Network)
+	} else {
+		baseline, err = a.repos.Prepare(ctx, sb, req)
+	}
 	if err != nil {
 		span.RecordError(err)
 		return PrepareRepositoryOutput{}, err
@@ -796,6 +805,67 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 		slog.String("run.id", in.RunID),
 		slog.String("repository.sha", baseline.SHA))
 	return PrepareRepositoryOutput{Baseline: baseline}, nil
+}
+
+// prepareRemoteRepository clones a remote repository, with a proxy-injected
+// credential when one is configured for it.
+//
+// The credentialed path fails closed: if the provider cannot apply the clone
+// policy, the clone is refused rather than attempted with the token in the
+// sandbox; and if the run's own policy cannot be restored afterwards, the
+// activity fails rather than leave the credential route in place while
+// repository or agent code runs.
+func (a *Activities) prepareRemoteRepository(ctx context.Context, sb sandbox.Sandbox, req repository.Request, restore sandbox.Network) (repository.Baseline, error) {
+	// Policy is checked before any credential is read or sent.
+	if err := a.repos.Validate(req); err != nil {
+		return repository.Baseline{}, err
+	}
+	cloneNet, secrets, credentialed, err := a.cfg.repositoryCloneNetwork(req.URL)
+	if err != nil {
+		return repository.Baseline{}, err
+	}
+	if !credentialed {
+		return a.repos.Prepare(ctx, sb, req)
+	}
+	a.redactor.Add(secrets...)
+	// The run's policy is put back afterwards, so it must be stated. "The
+	// deployment default" cannot be restored exactly on every provider (on
+	// Cube, an empty update clears template rules), and a restore that widens
+	// egress is worse than refusing the clone.
+	if restore.AllowInternet == nil {
+		return repository.Baseline{}, fmt.Errorf("a credentialed clone of %s needs an explicit egress policy to restore afterwards; give the run's scope an [egress.<name>] policy with allow_internet set", req.URL)
+	}
+	updater, ok := sb.(sandbox.NetworkUpdater)
+	if !ok {
+		return repository.Baseline{}, fmt.Errorf("sandbox provider %q cannot inject the repository credential at its egress proxy; refusing to clone %s", a.provider.Name(), req.URL)
+	}
+
+	applyErr := updater.UpdateNetwork(ctx, cloneNet)
+	var baseline repository.Baseline
+	var prepErr error
+	if applyErr == nil {
+		req.Shallow = true
+		baseline, prepErr = a.repos.Prepare(ctx, sb, req)
+	}
+	// Restore on every path, including a failed apply: a provider can report
+	// an error after the credential route is already live. The activity may
+	// be cancelling, so the restore gets its own bounded context.
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	if err := updater.UpdateNetwork(restoreCtx, restore); err != nil {
+		return repository.Baseline{}, fmt.Errorf("withdraw repository credential: %s", a.redactor.Redact(err.Error()))
+	}
+	if applyErr != nil {
+		return repository.Baseline{}, fmt.Errorf("apply repository clone policy: %s", a.redactor.Redact(applyErr.Error()))
+	}
+	if prepErr != nil {
+		// Git output cannot contain the token: it never entered the sandbox.
+		return repository.Baseline{}, prepErr
+	}
+	baseline.Credential = "github_token_file (proxy-injected)"
+	a.log.InfoContext(ctx, "repository fetched with a proxy-injected credential",
+		slog.String("repository", req.URL), slog.String("repository.sha", baseline.SHA))
+	return baseline, nil
 }
 
 // ApplyRuntimeNetwork replaces setup-time networking with the agent policy.

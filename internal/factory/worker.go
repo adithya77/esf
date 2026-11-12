@@ -62,6 +62,10 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (*Runtime, error) {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 
+	if err := cfg.CheckRepositoryCredentials(); err != nil {
+		return nil, err
+	}
+
 	harnesses, err := cfg.BuildHarnesses()
 	if err != nil {
 		return nil, fmt.Errorf("build harnesses: %w", err)
@@ -95,7 +99,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (*Runtime, error) {
 	return &Runtime{
 		Config:    cfg,
 		Provider:  provider,
-		Repos:     repository.New(cfg.Repositories.Allowed, repository.WithLocalPaths(cfg.Repositories.LocalPaths), repository.WithLogger(log)),
+		Repos:     repository.New(cfg.Repositories.Allowed, repository.WithLocalPaths(cfg.Repositories.LocalPaths), repository.WithMaxSnapshotBytes(cfg.Repositories.MaxSnapshotBytes), repository.WithLogger(log)),
 		Harnesses: harnesses,
 		Profiles:  cfg.VerificationProfiles(),
 		Artifacts: artifactFactory,
@@ -273,6 +277,7 @@ func collectSecrets(cfg Config, harnesses *agentharness.Registry) []string {
 		secrets = append(secrets, os.Getenv(name))
 	}
 	secrets = append(secrets, cfg.sandboxSecrets()...)
+	secrets = append(secrets, cfg.repositoryCredentialSecrets()...)
 	// Named model resources may grant a credential independently of a
 	// harness's static pass_env list. Register those values before any activity
 	// can persist agent output.

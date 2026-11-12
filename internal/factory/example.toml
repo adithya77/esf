@@ -157,6 +157,16 @@ allowed = []
 # operator control. Register the fixture path before running factory-run-demo.sh.
 local_paths = []
 # local_paths = ["/srv/esf/fixtures/factory-e2e"]
+# A local source is moved as one commit (the requested revision and its tree,
+# no history or other refs). This bounds that snapshot; 0 means 1 GiB.
+# max_snapshot_bytes = 1073741824
+# Private https://github.com repositories in `allowed`: a 0600 file holding a
+# read-only token. The sandbox provider's egress proxy injects it while the
+# repository is fetched (depth 1, exact revision) and withdraws it before any
+# repository or agent code runs; the token never enters the sandbox. Requires
+# a provider with runtime network control (Cube, Baseten). See
+# docs/private-repositories.md.
+# github_token_file = "/etc/factory/github-token"
 
 # ── Agent harnesses ──────────────────────────────────────────────────────────
 # The harness name is what a request may select. The executable and arguments
