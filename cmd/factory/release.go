@@ -19,7 +19,6 @@ import (
 	"github.com/mitkox/esf/internal/factory"
 	"github.com/mitkox/esf/internal/releaseinfo"
 	"github.com/mitkox/esf/internal/sandbox"
-	"github.com/mitkox/esf/internal/sandbox/cube"
 	"github.com/spf13/cobra"
 )
 
@@ -206,7 +205,7 @@ func newAgentsCommand(configPath *string) *cobra.Command {
 			}
 			if h.Preinstalled {
 				if templateSandbox == nil {
-					provider, err := cube.New(cfg.Cube)
+					provider, err := factory.NewSandboxProvider(cfg, nil)
 					if err != nil {
 						return err
 					}
@@ -311,11 +310,7 @@ func runStructuredDoctor(ctx context.Context, configPath, profile, output string
 		} else {
 			add("temporal_tls", nil)
 		}
-		if cfg.Cube.ProxyNodeIP != "" && cfg.Cube.ProxyScheme != "https" {
-			add("cube_data_tls", fmt.Errorf("cube.proxy_scheme must be https"))
-		} else {
-			add("cube_data_tls", nil)
-		}
+		add(cfg.SandboxProductionCheck())
 		names := make([]string, 0, len(cfg.Harnesses))
 		for name := range cfg.Harnesses {
 			names = append(names, name)
@@ -348,7 +343,7 @@ func runStructuredDoctor(ctx context.Context, configPath, profile, output string
 			add("runtime", err)
 		} else {
 			defer runtime.Close(probeCtx)
-			add("cube_reachable", runtime.Provider.Ping(probeCtx))
+			add(cfg.SandboxReachableCheck(), runtime.Provider.Ping(probeCtx))
 			client, err := runtime.TemporalClient()
 			if err != nil {
 				add("temporal_reachable", err)

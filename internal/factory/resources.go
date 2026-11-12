@@ -414,7 +414,7 @@ func (c Config) ResolveResources(req RunRequest) (ResolvedResources, error) {
 		SetupScript:  c.Sandbox.SetupScript,
 	}
 	if effectiveWorkspace.Template == "" {
-		effectiveWorkspace.Template = c.Cube.TemplateID
+		effectiveWorkspace.Template = c.SandboxTemplate()
 	}
 	workspaceName := req.Workspace
 	if workspaceName == "" && hasScope {

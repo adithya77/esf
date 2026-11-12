@@ -12,6 +12,7 @@ import (
 	"github.com/mitkox/esf/internal/agentharness"
 	artifacts "github.com/mitkox/esf/internal/factoryartifacts"
 	"github.com/mitkox/esf/internal/repository"
+	"github.com/mitkox/esf/internal/sandbox/baseten"
 	"github.com/mitkox/esf/internal/sandbox/cube"
 	"github.com/mitkox/esf/internal/tomlx"
 	"github.com/mitkox/esf/internal/verification"
@@ -34,6 +35,7 @@ type Config struct {
 	FactoryVersion string `toml:"factory_version"`
 
 	Cube     cube.Config    `toml:"cube"`
+	Baseten  baseten.Config `toml:"baseten"`
 	Temporal TemporalConfig `toml:"temporal"`
 	Storage  StorageConfig  `toml:"storage"`
 	Limits   LimitsConfig   `toml:"limits"`
@@ -79,6 +81,10 @@ type Config struct {
 
 // SandboxConfig controls factory-owned sandbox preparation.
 type SandboxConfig struct {
+	// Provider selects the execution fabric: "cubesandbox" (the default) or
+	// "baseten". Only the selected provider's section is validated and used.
+	Provider string `toml:"provider"`
+
 	// BasePackages are installed in EVERY sandbox before the agent harness is
 	// provisioned.
 	//
@@ -369,7 +375,11 @@ func applyEnvOverrides(cfg *Config) {
 // Validate checks the configuration at startup so a missing setting fails
 // immediately rather than in the middle of a run.
 func (c Config) Validate() error {
-	if err := c.Cube.Validate(); err != nil {
+	backend, err := c.sandboxBackend()
+	if err != nil {
+		return err
+	}
+	if err := backend.validate(c); err != nil {
 		return err
 	}
 	var problems []string
@@ -454,7 +464,7 @@ func (c Config) Validate() error {
 			if strings.EqualFold(strings.TrimSpace(h.Type), "opencode") && (len(h.PassEnv) != 0 || len(h.ProviderFiles) != 0) {
 				problems = append(problems, fmt.Sprintf("harness %q: opencode cube_egress forbids pass_env and provider_files", name))
 			}
-			if err := validateCredentialControlPlane(c.Cube.APIURL); err != nil {
+			if err := validateCredentialControlPlane(c.sandboxControlPlaneURL()); err != nil {
 				problems = append(problems, err.Error())
 			}
 		}

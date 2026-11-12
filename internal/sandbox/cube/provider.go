@@ -431,7 +431,7 @@ func (s *cubeSandbox) Execute(ctx context.Context, cmd sandbox.Command) (sandbox
 	}
 
 	started := time.Now().UTC()
-	result, err := s.sb.Commands().Run(ctx, boundedCommandScript(line, s.outputLimit), opts)
+	result, err := s.sb.Commands().Run(ctx, sandbox.BoundedCommandScript(line, s.outputLimit), opts)
 	finished := time.Now().UTC()
 	if err != nil {
 		// Distinguish "the command could not run" from "the command ran and

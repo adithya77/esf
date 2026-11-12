@@ -18,6 +18,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
+	"github.com/mitkox/esf/internal/sandbox"
 	"github.com/mitkox/esf/internal/tomlx"
 )
 
@@ -27,10 +28,10 @@ import (
 // unnoticed fallback to the wrong port produces a confusing failure. The API
 // URL is required configuration.
 const (
-	DefaultProxyPortHTTP            = 80
-	DefaultIdleTimeout              = 30 * time.Minute
-	DefaultRequestTimeout           = 60 * time.Second
-	DefaultCommandOutputBytes int64 = 4 << 20
+	DefaultProxyPortHTTP      = 80
+	DefaultIdleTimeout        = 30 * time.Minute
+	DefaultRequestTimeout     = 60 * time.Second
+	DefaultCommandOutputBytes = sandbox.DefaultCommandOutputBytes
 	// DefaultTemplate is empty: operators must select an existing READY template.
 	DefaultTemplate = ""
 )

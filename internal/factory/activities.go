@@ -20,6 +20,7 @@ import (
 	"github.com/mitkox/esf/internal/notify"
 	"github.com/mitkox/esf/internal/repository"
 	"github.com/mitkox/esf/internal/sandbox"
+	"github.com/mitkox/esf/internal/sandbox/cube"
 	"github.com/mitkox/esf/internal/threatmon"
 	"github.com/mitkox/esf/internal/verification"
 )
@@ -594,7 +595,7 @@ func (a *Activities) CreateSandbox(ctx context.Context, in CreateSandboxInput) (
 
 	template := in.Template
 	if template == "" {
-		template = a.cfg.Cube.TemplateID
+		template = a.cfg.SandboxTemplate()
 	}
 	spec := sandbox.Spec{
 		Template: template,
@@ -1272,7 +1273,7 @@ func (a *Activities) FinalizeResult(ctx context.Context, in FinalizeInput) (Fina
 		AgentHarness:            in.Request.AgentHarness,
 		AgentVersion:            in.HarnessVersion,
 		SandboxProvider:         a.provider.Name(),
-		CubeVersion:             a.cfg.Cube.Version,
+		CubeVersion:             a.cubeVersion(),
 		SandboxTemplate:         in.SandboxTemplate,
 		SandboxID:               in.SandboxID,
 		VerificationProfile:     in.Request.VerificationProfile,
@@ -1363,12 +1364,13 @@ func (a *Activities) WriteEnvironment(ctx context.Context, runID string, extra m
 	record := map[string]any{
 		"factory_version":  a.cfg.effectiveVersion(),
 		"sandbox_provider": a.provider.Name(),
-		"cube_api_url":     a.cfg.Cube.APIURL,
-		"cube_version":     a.cfg.Cube.Version,
-		"sandbox_template": a.cfg.Cube.TemplateID,
+		"sandbox_template": a.cfg.SandboxTemplate(),
 		"capabilities":     a.provider.Capabilities(),
 		"harnesses":        a.harnesses.Names(),
 		"recorded_at":      time.Now().UTC(),
+	}
+	for k, v := range a.cfg.sandboxEvidence() {
+		record[k] = v
 	}
 	for k, v := range extra {
 		record[k] = v
@@ -1489,6 +1491,15 @@ func attemptFromContext(ctx context.Context) int {
 		return int(activity.GetInfo(ctx).Attempt)
 	}
 	return 1
+}
+
+// cubeVersion is recorded only when Cube is the provider; a Baseten run must
+// not carry a Cube version picked up from the environment.
+func (a *Activities) cubeVersion() string {
+	if a.cfg.SandboxProvider() != cube.ProviderName {
+		return ""
+	}
+	return a.cfg.Cube.Version
 }
 
 // metricAttrs builds the standard low-cardinality attribute set for a metric
