@@ -230,7 +230,7 @@ func (p *Provider) prepareRemote(ctx context.Context, sb sandbox.Sandbox, req Re
 // and one upload-pack, both under the repository's own path. That is what
 // lets a proxy-injected credential be scoped to this repository alone.
 func (p *Provider) prepareRemoteShallow(ctx context.Context, sb sandbox.Sandbox, req Request, dest string) (Baseline, error) {
-	if strings.ContainsAny(req.Revision, ":+*^~ ") {
+	if !FetchableRevision(req.Revision) {
 		return Baseline{}, fmt.Errorf("%w: a shallow fetch needs a commit SHA or ref name, not %q", ErrRepositoryRejected, req.Revision)
 	}
 	// GitHub and other hosts serve SHA-1 repositories; a SHA-256 remote fails
@@ -372,6 +372,173 @@ func (p *Provider) prepareLocal(ctx context.Context, sb sandbox.Sandbox, req Req
 		Shallow:       true,
 		SnapshotBytes: snapshot.size,
 	}, dest, snapshot.sha)
+}
+
+// WarmBase describes a repository that Prepare already put into a sandbox,
+// which Update can move to another revision.
+type WarmBase struct {
+	SHA            string            `json:"sha"`
+	LockfileHashes map[string]string `json:"lockfile_hashes,omitempty"`
+}
+
+// Update moves a repository that Prepare left at base to req.Revision,
+// sending only what the sandbox lacks: nothing when the revision is the base,
+// otherwise the target commit and the objects its tree adds to the base's. A
+// remote repository fetches the revision at depth 1 from its existing origin.
+// The checkout is verified like a fresh one.
+func (p *Provider) Update(ctx context.Context, sb sandbox.Sandbox, req Request, base WarmBase) (Baseline, error) {
+	if err := p.Validate(req); err != nil {
+		return Baseline{}, err
+	}
+	if base.SHA == "" {
+		return Baseline{}, fmt.Errorf("repository: warm base has no commit")
+	}
+	dest := path.Clean(req.DestDir)
+	if req.DestDir == "" {
+		dest = "/workspace/repository"
+	}
+	switch req.Kind {
+	case SourceLocal:
+		return p.updateLocal(ctx, sb, req, dest, base)
+	case SourceRemote:
+		if !FetchableRevision(req.Revision) {
+			return Baseline{}, fmt.Errorf("%w: a warm fetch needs a commit SHA or ref name, not %q", ErrRepositoryRejected, req.Revision)
+		}
+		return p.updateRemote(ctx, sb, req, dest)
+	default:
+		return Baseline{}, fmt.Errorf("repository: unknown source kind %q", req.Kind)
+	}
+}
+
+// updateRemote fetches the revision at depth 1 from the warm repository's
+// origin. The baseline ref is force-updated (the factory adds the "+"; a
+// revision cannot contain one) because the target need not descend from the
+// base.
+func (p *Provider) updateRemote(ctx context.Context, sb sandbox.Sandbox, req Request, dest string) (Baseline, error) {
+	if err := runAll(ctx, sb, []sandbox.Command{{
+		Argv:        []string{"git", "-C", dest, "fetch", "--depth", "1", "--no-tags", "--end-of-options", "origin", "+" + req.Revision + ":" + baselineRef},
+		Timeout:     10 * time.Minute,
+		Env:         map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		Description: "fetch revision",
+	}}); err != nil {
+		return Baseline{}, err
+	}
+	return p.checkout(ctx, sb, Baseline{Kind: SourceRemote, Source: req.URL, RequestedRev: req.Revision, Shallow: true}, dest, baselineRef)
+}
+
+func (p *Provider) updateLocal(ctx context.Context, sb sandbox.Sandbox, req Request, dest string, base WarmBase) (Baseline, error) {
+	if err := validateLocalPath(req.LocalPath, p.localPaths); err != nil {
+		return Baseline{}, err
+	}
+	if err := p.validateLocalGitRoot(ctx, req.LocalPath); err != nil {
+		return Baseline{}, err
+	}
+	resolved, err := p.runHostCommand(ctx, req.LocalPath, append([]string{"rev-parse", "--verify", "--quiet"}, revisionArgs(req.Revision)...)...)
+	if err != nil {
+		return Baseline{}, fmt.Errorf("%w: revision %q does not name a commit in %s", ErrRepositoryRejected, req.Revision, req.LocalPath)
+	}
+	target := strings.TrimSpace(resolved)
+	out := Baseline{Kind: SourceLocal, Source: "local:" + req.LocalPath, RequestedRev: req.Revision, Shallow: true}
+	if target == base.SHA {
+		return p.checkout(ctx, sb, out, dest, target)
+	}
+
+	var snap localSnapshot
+	if _, missing := p.runHostCommand(ctx, req.LocalPath, "cat-file", "-e", base.SHA+"^{commit}"); missing == nil {
+		snap, err = p.treeDelta(ctx, req.LocalPath, base.SHA, target)
+	} else {
+		// The base is gone from the host (rewritten or collected): send the
+		// target's whole tree, as a cold preparation would.
+		snap, err = p.snapshotLocal(ctx, Request{LocalPath: req.LocalPath, Revision: target})
+	}
+	if err != nil {
+		return Baseline{}, err
+	}
+	// The target is shallow in the sandbox: its tree is complete, its
+	// history is not, whatever shape the history between base and target has.
+	if err := sb.WriteFile(ctx, path.Join(dest, ".git", "shallow"), []byte(base.SHA+"\n"+target+"\n")); err != nil {
+		snap.cleanup()
+		return Baseline{}, fmt.Errorf("repository: mark target shallow: %w", err)
+	}
+	defer snap.cleanup()
+	bundle := "/tmp/esf-snapshot-" + target[:16] + ".bundle"
+	if err := writeSnapshot(ctx, sb, bundle, snap); err != nil {
+		return Baseline{}, fmt.Errorf("repository: push snapshot into sandbox: %w", err)
+	}
+	if err := runAll(ctx, sb, []sandbox.Command{
+		// Forced: the target need not descend from the current baseline ref.
+		{Argv: []string{"git", "-C", dest, "fetch", "-q", "--no-tags", bundle, "+" + snapshotRef + ":" + baselineRef}, Timeout: 5 * time.Minute, Description: "unpack snapshot"},
+		{Argv: []string{"rm", "-f", "--", bundle}, Description: "remove snapshot bundle"},
+	}); err != nil {
+		return Baseline{}, err
+	}
+	out.SnapshotBytes = snap.size
+	return p.checkout(ctx, sb, out, dest, target)
+}
+
+// treeDelta bundles the target commit with exactly the objects its tree
+// needs beyond the base's tree: what a warm sandbox, which already holds the
+// base, lacks. History between the two is not sent, so merges, rewinds and
+// unrelated histories all work; the sandbox marks the target shallow.
+//
+// The bundle is written directly (header plus a pack from git pack-objects),
+// because git bundle can only cut history ranges, which drag in the parents
+// of every merge. The host repository is only read.
+func (p *Provider) treeDelta(ctx context.Context, local, base, target string) (localSnapshot, error) {
+	format, err := p.runHostCommand(ctx, local, "rev-parse", "--show-object-format")
+	if err != nil {
+		return localSnapshot{}, err
+	}
+	format = strings.TrimSpace(format)
+	objects, err := p.runHostCommand(ctx, local, "rev-list", "--objects", "--no-object-names", target+"^{tree}", "--not", base+"^{tree}")
+	if err != nil {
+		return localSnapshot{}, fmt.Errorf("repository: list objects for %s: %w", target[:12], err)
+	}
+	scratch, err := os.MkdirTemp("", "factory-delta-*")
+	if err != nil {
+		return localSnapshot{}, fmt.Errorf("repository: create snapshot directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(scratch) }
+	file := filepath.Join(scratch, "delta.bundle")
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		cleanup()
+		return localSnapshot{}, err
+	}
+	header := "# v2 git bundle\n"
+	if format == "sha256" {
+		header = "# v3 git bundle\n@object-format=sha256\n"
+	}
+	if _, err := fmt.Fprintf(f, "%s%s %s\n\n", header, target, snapshotRef); err != nil {
+		f.Close()
+		cleanup()
+		return localSnapshot{}, err
+	}
+	list := target + "\n" + objects
+	if err := runGitHostIO(ctx, local, strings.NewReader(list), f, "pack-objects", "--stdout", "-q"); err != nil {
+		f.Close()
+		cleanup()
+		return localSnapshot{}, fmt.Errorf("repository: pack %s: %w", target[:12], err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return localSnapshot{}, err
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		cleanup()
+		return localSnapshot{}, err
+	}
+	limit := p.maxSnapshotBytes
+	if limit <= 0 {
+		limit = DefaultMaxSnapshotBytes
+	}
+	if info.Size() > limit {
+		cleanup()
+		return localSnapshot{}, fmt.Errorf("%w: the change from %s to %s is %s, over repositories.max_snapshot_bytes (%s)",
+			ErrSnapshotTooLarge, base[:12], target[:12], humanBytes(info.Size()), humanBytes(limit))
+	}
+	return localSnapshot{file: file, sha: target, objectFormat: format, size: info.Size(), cleanup: cleanup}, nil
 }
 
 // snapshotRef names the commit inside a snapshot bundle.
@@ -545,6 +712,20 @@ func (p *Provider) checkout(ctx context.Context, sb sandbox.Sandbox, base Baseli
 			sha, checkout.ExitCode, truncate(checkout.Stderr, 400))
 	}
 
+	// The agent must start from exactly the resolved commit, and from the
+	// requested one when the request named a full SHA. A stale or different
+	// tree fails here rather than producing evidence about the wrong code.
+	head, err := runOne(ctx, sb, dest, "rev-parse", "HEAD")
+	if err != nil {
+		return Baseline{}, err
+	}
+	if got := strings.TrimSpace(head.Stdout); got != sha {
+		return Baseline{}, fmt.Errorf("repository: HEAD is %s after checking out %s", got, sha)
+	}
+	if isFullSHA(base.RequestedRev) && !strings.EqualFold(base.RequestedRev, sha) {
+		return Baseline{}, fmt.Errorf("repository: requested %s but prepared %s", base.RequestedRev, sha)
+	}
+
 	status, err := runOne(ctx, sb, dest, "status", "--porcelain")
 	if err != nil {
 		return Baseline{}, err
@@ -560,6 +741,25 @@ func (p *Provider) checkout(ctx context.Context, sb sandbox.Sandbox, base Baseli
 	base.PreparedAt = time.Now().UTC()
 	base.LockfileHashes = p.hashLockfiles(ctx, sb, dest)
 	return base, nil
+}
+
+// FetchableRevision reports whether a revision can be fetched by name from a
+// remote at depth 1: a commit SHA or a ref name, not an expression such as
+// main~1 or v1^{}.
+func FetchableRevision(rev string) bool { return !strings.ContainsAny(rev, ":+*^~ ") }
+
+// isFullSHA reports whether a revision is a complete SHA-1 or SHA-256 object
+// name, which must then match the prepared commit exactly.
+func isFullSHA(rev string) bool {
+	if len(rev) != 40 && len(rev) != 64 {
+		return false
+	}
+	for _, r := range rev {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // revisionArgs renders a revision for `git rev-parse`.
@@ -579,7 +779,7 @@ func revisionArgs(revision string) []string {
 var lockfileCandidates = []string{
 	"go.sum", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
 	"requirements.txt", "poetry.lock", "Pipfile.lock", "Cargo.lock",
-	"Gemfile.lock", "composer.lock",
+	"Gemfile.lock", "composer.lock", "bun.lock", "bun.lockb",
 }
 
 func (p *Provider) hashLockfiles(ctx context.Context, sb sandbox.Sandbox, dest string) map[string]string {
@@ -708,16 +908,36 @@ func (p *Provider) validateLocalGitRoot(ctx context.Context, dir string) error {
 	return nil
 }
 
-func runGitHost(ctx context.Context, dir string, args ...string) (string, error) {
+// runGitHostIO runs a host git command with explicit stdin and stdout,
+// under the same environment rules as runGitHost.
+func runGitHostIO(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	// Host Git is a local object transport. Ambient repository/config overrides
-	// must not redirect the operator-registered source to another repository.
-	cmd.Env = []string{}
+	cmd.Env = hostGitEnv()
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// hostGitEnv drops GIT_* variables: host git is a local object transport,
+// and ambient repository or config overrides must not redirect it.
+func hostGitEnv() []string {
+	var env []string
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(entry, "GIT_") {
-			cmd.Env = append(cmd.Env, entry)
+			env = append(env, entry)
 		}
 	}
+	return env
+}
+
+func runGitHost(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = hostGitEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

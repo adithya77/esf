@@ -322,3 +322,139 @@ func TestRepositoryDirectoryIsNormalised(t *testing.T) {
 		t.Fatalf("root destination: %v", err)
 	}
 }
+
+func TestWarmUpdateShipsOnlyTheMissingCommits(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	p := New(nil, WithLocalPaths([]string{repo}))
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	base, err := p.Prepare(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[0], DestDir: dest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm := WarmBase{SHA: base.SHA, LockfileHashes: base.LockfileHashes}
+
+	// Descendant: only base..target travels, and it is far smaller than a snapshot.
+	got, err := p.Update(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: "main", DestDir: dest}, warm)
+	if err != nil || got.SHA != shas[2] || got.RequestedRev != "main" {
+		t.Fatalf("update to main: %+v %v", got, err)
+	}
+	if got.SnapshotBytes <= 0 || got.SnapshotBytes >= base.SnapshotBytes+1024 {
+		t.Fatalf("range bundle = %d bytes (snapshot was %d)", got.SnapshotBytes, base.SnapshotBytes)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "file.txt")); string(data) != "three\n" {
+		t.Fatalf("worktree = %q", data)
+	}
+	// The host repository was only read.
+	if refs := gitOut(t, repo, "for-each-ref", "--format=%(refname)"); strings.Contains(refs, "esf") {
+		t.Fatalf("host refs written: %q", refs)
+	}
+
+	// Back to the base: nothing to send.
+	got, err = p.Update(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[0], DestDir: dest}, warm)
+	if err != nil || got.SHA != shas[0] || got.SnapshotBytes != 0 {
+		t.Fatalf("update to base: %+v %v", got, err)
+	}
+}
+
+func TestWarmUpdateToAnOlderCommit(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	p := New(nil, WithLocalPaths([]string{repo}))
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	base, err := p.Prepare(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[2], DestDir: dest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An older commit is not a descendant of the base.
+	got, err := p.Update(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[1], DestDir: dest}, WarmBase{SHA: base.SHA})
+	if err != nil || got.SHA != shas[1] {
+		t.Fatalf("update to an ancestor: %+v %v", got, err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "file.txt")); string(data) != "two\n" {
+		t.Fatalf("worktree = %q", data)
+	}
+}
+
+func TestWarmRemoteUpdateFetchesTheRevision(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	gitOut(t, repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+	p := New(nil)
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	if _, err := p.prepareRemoteShallow(context.Background(), sb, Request{URL: "file://" + repo, Revision: shas[2], Shallow: true}, dest); err != nil {
+		t.Fatal(err)
+	}
+	// Backwards, then forwards: both are forced updates of the baseline ref.
+	for _, rev := range []string{shas[0], shas[1]} {
+		got, err := p.updateRemote(context.Background(), sb, Request{URL: "file://" + repo, Revision: rev}, dest)
+		if err != nil || got.SHA != rev {
+			t.Fatalf("update to %s: %+v %v", rev[:8], got, err)
+		}
+	}
+}
+
+func TestCheckoutRefusesADifferentCommitThanRequested(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	p := New(nil, WithLocalPaths([]string{repo}))
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	if _, err := p.Prepare(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[0], DestDir: dest}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := p.checkout(context.Background(), sb, Baseline{RequestedRev: shas[1]}, dest, shas[0])
+	if err == nil || !strings.Contains(err.Error(), "requested") {
+		t.Fatalf("a different commit than requested was accepted: %v", err)
+	}
+}
+
+// The live failure: base..target over a merge needs the merged branch's
+// parents, which a warm sandbox does not have. The tree delta does not care.
+func TestWarmUpdateAcrossAMerge(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	git := func(args ...string) string {
+		return gitOut(t, repo, append([]string{"-c", "user.name=F", "-c", "user.email=f@test"}, args...)...)
+	}
+	git("checkout", "-q", "-b", "feature", shas[0])
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-qm", "side work")
+	git("checkout", "-q", "main")
+	git("merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+	merge := git("rev-parse", "HEAD")
+
+	p := New(nil, WithLocalPaths([]string{repo}))
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	base, err := p.Prepare(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[2], DestDir: dest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.Update(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: merge, DestDir: dest}, WarmBase{SHA: base.SHA})
+	if err != nil || got.SHA != merge {
+		t.Fatalf("update to merge: %+v %v", got, err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "feature.txt")); string(data) != "side\n" {
+		t.Fatalf("merged file = %q", data)
+	}
+	if out := gitOut(t, dest, "fsck", "--connectivity-only", "--no-dangling"); out != "" {
+		t.Fatalf("fsck: %s", out)
+	}
+}
+
+func TestWarmUpdateWhenTheBaseIsGoneFromTheHost(t *testing.T) {
+	repo, shas := fixtureRepo(t)
+	p := New(nil, WithLocalPaths([]string{repo}))
+	dest := filepath.Join(t.TempDir(), "repository")
+	sb := &hostSandbox{t: t}
+	if _, err := p.Prepare(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[0], DestDir: dest}); err != nil {
+		t.Fatal(err)
+	}
+	gone := strings.Repeat("ab", 20) // a base the host never had, as after a rewrite
+	got, err := p.Update(context.Background(), sb, Request{Kind: SourceLocal, LocalPath: repo, Revision: shas[2], DestDir: dest}, WarmBase{SHA: gone})
+	if err != nil || got.SHA != shas[2] {
+		t.Fatalf("update: %+v %v", got, err)
+	}
+}

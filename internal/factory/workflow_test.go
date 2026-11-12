@@ -226,7 +226,7 @@ func baseRequest(t *testing.T) RunRequest {
 		RunID:               "run-workflow-test",
 		LocalPath:           repo,
 		RepositoryKind:      "local",
-		Revision:            fixtureSHA(t, repo),
+		Revision:            "HEAD", // the fake sandbox answers every rev-parse with testSHA
 		Task:                "change the greeting",
 		AgentHarness:        "test-agent",
 		VerificationProfile: "default",
