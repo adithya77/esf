@@ -18,6 +18,34 @@ proxy_scheme    = "https"
 idle_timeout    = "60m"
 request_timeout = "60s"
 
+# Baseten Sandboxes, instead of Cube: set [sandbox].provider = "baseten" and
+# fill this section; the [cube] section is then ignored. Every sandbox is
+# created behind Blaxel's egress proxy, so runtime lockdown and cube_egress
+# credential injection work without a Cube install. The proxy is a vendor
+# public preview: `factory doctor --profile production` does not qualify it.
+# See docs/baseten.md.
+#
+# [baseten]
+# api_key_file = "/etc/factory/baseten-api-key"  # 0600; or BASETEN_API_KEY
+# region       = "us-pdx-1"                      # must offer the egress proxy
+# template     = "blaxel/claude-code:latest"     # sandbox image
+# memory_mib   = 4096                            # 1 vCPU per 2048 MiB
+# idle_timeout = "30m"                           # leak backstop (ttl-idle)
+# workspace    = ""                              # empty: the key's only workspace
+#
+# blaxel/claude-code ships Claude Code 2.1.178. Pin it like a Cube template
+# agent and check the pin with `factory agents verify` (verified 2026-11-12):
+#
+# [harnesses.claude]
+# type            = "claude"
+# binary          = "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+# preinstalled    = true
+# binary_sha256   = "17ed1a983a49404c4673de286419a8fd6617c92440a2e0f789bcc413a3b14de1"
+# model           = "YOUR_APPROVED_CLAUDE_MODEL"
+# api_key_file    = "/etc/factory/anthropic-api-key"
+# credential_mode = "cube_egress"
+# base_url        = "https://api.anthropic.com"
+
 [temporal]
 host_port  = "temporal.example.org:7233"
 tls        = true
@@ -36,6 +64,7 @@ task_queue = "factory"
 data_dir = "/var/lib/esf/factory"
 
 [sandbox]
+# provider = "cubesandbox"  # or "baseten"; see [baseten] above
 # Use a versioned Cube template with pinned Git, CA certificates, sha256sum,
 # head, mkfifo, and the configured agent binaries. Empty avoids network package
 # installation for every run. A development template may opt in to packages.

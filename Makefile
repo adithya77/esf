@@ -85,6 +85,10 @@ test-unit: ## Run unit tests only (fast)
 test-integration: ## Run tests that need the live CubeSandbox (tagged integration)
 	$(GO) test -tags=integration ./... -count=1 -v
 
+.PHONY: test-baseten
+test-baseten: ## Run live Baseten provider tests (needs FACTORY_BASETEN_API_KEY_FILE)
+	$(GO) test -tags=baseten ./internal/sandbox/baseten -count=1 -v
+
 .PHONY: lint
 lint: ## Check Go formatting, vet, and shell scripts without changing files
 	@out=$$(find cmd internal -name '*.go' -print0 | xargs -0 gofmt -l); if [ -n "$$out" ]; then echo "unformatted Go files:"; echo "$$out"; exit 1; fi
