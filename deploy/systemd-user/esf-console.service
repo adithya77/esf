@@ -1,0 +1,17 @@
+# ESF read-only console on loopback, as a systemd user service.
+# Installed by scripts/install-user-services.sh, which substitutes @BIN@.
+[Unit]
+Description=ESF console (read-only, loopback)
+After=esf-worker.service
+
+[Service]
+Type=simple
+ExecStart=@BIN@ console --config %h/.config/esf/factory.toml --listen 127.0.0.1:7331 --read-token-file %h/.config/esf/console.token
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

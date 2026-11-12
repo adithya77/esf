@@ -1,0 +1,18 @@
+# ESF Temporal stack (docker compose) as a systemd user service.
+# Installed by scripts/install-user-services.sh, which substitutes @ESF_ROOT@.
+# The containers restart themselves (restart: unless-stopped); this unit
+# brings the stack up at login/boot (with lingering) and waits until healthy.
+[Unit]
+Description=ESF Temporal stack (docker compose)
+Documentation=file://@ESF_ROOT@/docs/baseten.md
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose --project-directory @ESF_ROOT@/deployments/dev/temporal up -d
+ExecStart=@ESF_ROOT@/deployments/dev/temporal/scripts/wait-ready.sh
+ExecStop=/usr/bin/docker compose --project-directory @ESF_ROOT@/deployments/dev/temporal stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

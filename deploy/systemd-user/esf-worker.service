@@ -1,0 +1,22 @@
+# ESF factory worker as a systemd user service.
+# Installed by scripts/install-user-services.sh, which substitutes @BIN@.
+[Unit]
+Description=ESF factory worker
+Requires=esf-temporal.service
+After=esf-temporal.service network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=@BIN@ worker --config %h/.config/esf/factory.toml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target
