@@ -17,9 +17,12 @@ assert hashlib.sha256((root / "internal/agentharness/pi-catalog.json").read_byte
 digest = hashlib.sha256((root / "agents/pi/dist/pi-runner.mjs").read_bytes()).hexdigest()
 assert digest == inventory["runner"]["sha256"], "Pi runner inventory mismatch"
 assert (root / "agents/pi/dist/SHA256SUMS").read_text() == digest + "  pi-runner.mjs\n"
-dockerfile = (root / "deploy/cube/Dockerfile.pi-v1").read_text()
-for entry in (inventory["runtime"], inventory["runner"]):
-    assert entry["sha256"] in dockerfile, "Pi template pin mismatch"
-assert inventory["runtime"]["image"] in dockerfile
+# Every template that carries the Pi execution chain pins the same runtime and
+# runner: the Cube candidate and the Baseten image.
+for template in ("deploy/cube/Dockerfile.pi-v1", "deploy/baseten/Dockerfile.pi"):
+    dockerfile = (root / template).read_text()
+    for entry in (inventory["runtime"], inventory["runner"]):
+        assert entry["sha256"] in dockerfile, f"Pi template pin mismatch in {template}"
+    assert inventory["runtime"]["image"] in dockerfile, f"Pi runtime image mismatch in {template}"
 assert hashlib.sha256((root / "agents/pi/dist/THIRD_PARTY_NOTICES.txt").read_bytes()).hexdigest() == inventory["third_party_notices_sha256"], "Pi license notices mismatch"
 print("Pi candidate inventory and pinned dependency graph verified")

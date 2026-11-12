@@ -1,0 +1,44 @@
+# ESF Pi sandbox image for Baseten Sandboxes (Blaxel microVMs).
+#
+# Every input is pinned by digest. The agent runs as an unprivileged user so
+# `hardening.require_non_root` can pass: the Blaxel sandbox API stays root
+# (it configures networking and the proxy CA) and drops to this user for every
+# command and file operation (BL_SANDBOX_USER_ENABLED).
+#
+# Build context: see scripts/build-baseten-pi-image.sh, which stages only this
+# file and the committed Pi bundle, so no credential can reach the image.
+ARG NODE_BASE=docker.io/library/node@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39
+ARG SANDBOX_API=ghcr.io/blaxel-ai/sandbox@sha256:9af82152008e1cdf9287768b8769687077c0a0830474482998d1701b6afa7f90
+ARG DEBIAN_BASE=docker.io/library/debian@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+
+FROM ${NODE_BASE} AS node-runtime
+FROM ${SANDBOX_API} AS sandbox-api
+
+FROM ${DEBIAN_BASE}
+# git, python3 and coreutils are the factory's prerequisites (repository
+# preparation, bounded output, the fixture's gates); libatomic1 is Node's.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends bash ca-certificates curl git libatomic1 python3 && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=sandbox-api /sandbox-api /usr/local/bin/sandbox-api
+COPY --from=node-runtime /usr/local/bin/node /opt/esf/agents/node
+COPY pi-runner.mjs /opt/esf/agents/pi-runner.mjs
+COPY inventory.json /opt/esf/pi-inventory.json
+COPY THIRD_PARTY_NOTICES.txt /opt/esf/pi-third-party-notices.txt
+RUN chmod 0755 /opt/esf/agents/node /usr/local/bin/sandbox-api && \
+    echo '0adde40d1b7dfa57c8bc83cbc319758c3ec6ebba21363bb2fa752ea6b267ad1b  /opt/esf/agents/node' | sha256sum -c - && \
+    echo '2f2b5191139a564050c98f0784e9be63893d47685abc6ac8a4049a942b201993  /opt/esf/agents/pi-runner.mjs' | sha256sum -c - && \
+    useradd --uid 10001 --create-home --home-dir /home/agent --shell /bin/bash agent && \
+    install -d -o agent -g agent /workspace
+WORKDIR /workspace
+USER agent
+# Blaxel routes all egress through its proxy and sets HTTP(S)_PROXY and the
+# proxy CA (NODE_EXTRA_CA_CERTS) for every process. Node's fetch ignores the
+# proxy variables unless NODE_USE_ENV_PROXY is set, and the firewall drops
+# direct connections, so without it every model request times out.
+ENV HOME=/home/agent \
+    BL_SANDBOX_USER_ENABLED=true \
+    NODE_USE_ENV_PROXY=1
+LABEL org.opencontainers.image.title="ESF Pi sandbox for Baseten" \
+      io.esf.pi.contract="esf/pi/v1" io.esf.pi.durable.version="1.5.0"
+ENTRYPOINT ["/usr/local/bin/sandbox-api"]
