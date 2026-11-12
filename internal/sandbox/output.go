@@ -1,12 +1,17 @@
-package cube
+package sandbox
 
 import "fmt"
 
-// boundedCommandScript uses FIFOs so each stream is capped before the Cube SDK
-// sees it. The extra byte distinguishes an exact-limit result from overflow.
-// A noisy process receives a closed pipe and the wrapper returns a distinct
-// failure after preserving the bounded diagnostic prefix.
-func boundedCommandScript(line string, limit int64) string {
+// DefaultCommandOutputBytes bounds a command's combined stdout and stderr when
+// the operator configures no limit.
+const DefaultCommandOutputBytes int64 = 4 << 20
+
+// BoundedCommandScript wraps a rendered command line so each output stream is
+// capped inside the sandbox, before a provider's data plane buffers it. FIFOs
+// keep the cap streaming; the extra byte distinguishes an exact-limit result
+// from overflow. A noisy process receives a closed pipe and the wrapper exits
+// 122 after preserving the bounded diagnostic prefix.
+func BoundedCommandScript(line string, limit int64) string {
 	if limit < 2048 {
 		limit = DefaultCommandOutputBytes
 	}
