@@ -714,7 +714,7 @@ func runRequestFromSpec(cfg factory.Config, spec runSpec) (factory.RunRequest, e
 		req.Model = spec.Model
 	}
 	if spec.SandboxTemplate == "" {
-		req.SandboxTemplate = cfg.Cube.TemplateID
+		req.SandboxTemplate = cfg.SandboxTemplate()
 	}
 	if spec.AgentTimeout != "" {
 		d, err := time.ParseDuration(spec.AgentTimeout)

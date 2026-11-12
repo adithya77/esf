@@ -165,7 +165,7 @@ func readCredentialFile(path string) (string, error) {
 func validateCredentialControlPlane(rawURL string) error {
 	endpoint, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || endpoint.Hostname() == "" {
-		return fmt.Errorf("cube.api_url is invalid for credential injection")
+		return fmt.Errorf("the sandbox control-plane URL is invalid for credential injection")
 	}
 	if endpoint.Scheme == "https" {
 		return nil
@@ -177,7 +177,7 @@ func validateCredentialControlPlane(rawURL string) error {
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return nil
 	}
-	return fmt.Errorf("cube.api_url must use HTTPS or loopback when cube_egress carries credentials")
+	return fmt.Errorf("the sandbox control-plane URL (cube.api_url or baseten.control_plane_url) must use HTTPS or loopback when cube_egress carries credentials")
 }
 
 func boolPointer(value bool) *bool { return &value }

@@ -6,8 +6,8 @@
 //	factory status   inspect a run
 //	factory logs     show a run's evidence
 //	factory worker   run the Temporal worker
-//	factory doctor   verify Cube, Temporal and configuration before running
-//	factory sandboxes list Cube sandboxes to find leaks
+//	factory doctor   verify the sandbox provider, Temporal and configuration before running
+//	factory sandboxes list provider sandboxes to find leaks
 //
 // The CLI is also the control plane's security boundary: it accepts only an
 // approved repository, an exact revision and task text. It never accepts an
@@ -214,7 +214,7 @@ execute an arbitrary program.`,
 				req.AgentTimeout = agentTO
 			}
 			if req.SandboxTemplate == "" {
-				req.SandboxTemplate = cfg.Cube.TemplateID
+				req.SandboxTemplate = cfg.SandboxTemplate()
 			}
 
 			runtime, err := factory.NewRuntime(ctx, factory.RuntimeOptions{Config: cfg})
@@ -664,9 +664,10 @@ func newDoctorCommand(configPath *string) *cobra.Command {
 			}
 			fmt.Println("Configuration:")
 			fmt.Printf("  data dir:        %s\n", cfg.Storage.DataDir)
-			fmt.Printf("  cube api:        %s\n", cfg.Cube.APIURL)
-			fmt.Printf("  cube template:   %s\n", cfg.Cube.TemplateID)
-			fmt.Printf("  cube api key:    %s\n", redacted(cfg.Cube.APIKey))
+			fmt.Printf("  sandbox:         %s\n", cfg.SandboxProvider())
+			for _, line := range cfg.SandboxDoctorLines() {
+				fmt.Printf("  %s\n", line)
+			}
 			fmt.Printf("  temporal:        %s (namespace %s)\n", cfg.Temporal.HostPort, cfg.Temporal.Namespace)
 			fmt.Printf("  task queue:      %s\n", cfg.Temporal.TaskQueue)
 			fmt.Printf("  remote repos:    %v\n", cfg.Repositories.Allowed)
@@ -693,7 +694,7 @@ func newDoctorCommand(configPath *string) *cobra.Command {
 			}
 			fmt.Println()
 
-			fmt.Println("CubeSandbox:")
+			fmt.Printf("Sandbox provider (%s):\n", cfg.SandboxProvider())
 			if offline {
 				fmt.Println("  [skip] connectivity check disabled (--offline)")
 			} else if runtime, err := factory.NewRuntime(ctx, factory.RuntimeOptions{Config: cfg}); err == nil {
@@ -702,8 +703,7 @@ func newDoctorCommand(configPath *string) *cobra.Command {
 					fmt.Printf("  [FAIL] %v\n", err)
 					problems++
 				} else {
-					fmt.Printf("  [ok]   provider %s reachable, template %s exists\n",
-						runtime.Provider.Name(), cfg.Cube.TemplateID)
+					fmt.Printf("  [ok]   provider %s reachable, %s\n", runtime.Provider.Name(), cfg.SandboxPingSummary())
 					if infos, err := runtime.Provider.List(ctx); err == nil {
 						fmt.Printf("  [ok]   %d live sandbox(es)\n", len(infos))
 						for _, info := range infos {

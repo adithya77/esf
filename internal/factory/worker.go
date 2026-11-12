@@ -18,7 +18,6 @@ import (
 	"github.com/mitkox/esf/internal/factoryartifacts"
 	"github.com/mitkox/esf/internal/repository"
 	"github.com/mitkox/esf/internal/sandbox"
-	"github.com/mitkox/esf/internal/sandbox/cube"
 	"github.com/mitkox/esf/internal/verification"
 )
 
@@ -70,14 +69,9 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (*Runtime, error) {
 
 	provider := opts.SandboxProvider
 	if provider == nil {
-		if cfg.Limits.CommandOutputBytes > 0 {
-			cfg.Cube.CommandOutputBytes = cfg.Limits.CommandOutputBytes
+		if provider, err = NewSandboxProvider(cfg, log); err != nil {
+			return nil, err
 		}
-		cubeProvider, err := cube.New(cfg.Cube, cube.WithLogger(log))
-		if err != nil {
-			return nil, fmt.Errorf("build cubesandbox provider: %w", err)
-		}
-		provider = cubeProvider
 	}
 
 	artifactLimit := cfg.Limits.ArtifactBytes
@@ -250,7 +244,7 @@ func (r *Runtime) RunWorker(ctx context.Context) error {
 		slog.String("temporal.namespace", r.Config.Temporal.Namespace),
 		slog.String("task_queue", r.Config.Temporal.TaskQueue),
 		slog.String("sandbox.provider", r.Provider.Name()),
-		slog.String("sandbox.template", r.Config.Cube.TemplateID),
+		slog.String("sandbox.template", r.Config.SandboxTemplate()),
 		slog.Any("harnesses", r.Harnesses.Names()),
 		slog.String("artifacts", r.Artifacts.Root()),
 	)
@@ -278,9 +272,7 @@ func collectSecrets(cfg Config, harnesses *agentharness.Registry) []string {
 	if name := cfg.Temporal.APIKeyEnv; name != "" {
 		secrets = append(secrets, os.Getenv(name))
 	}
-	if cfg.Cube.APIKey != "" {
-		secrets = append(secrets, cfg.Cube.APIKey)
-	}
+	secrets = append(secrets, cfg.sandboxSecrets()...)
 	// Named model resources may grant a credential independently of a
 	// harness's static pass_env list. Register those values before any activity
 	// can persist agent output.
