@@ -257,6 +257,14 @@ func (r *Runtime) RunWorker(ctx context.Context) error {
 		return fmt.Errorf("temporal worker stopped: %w", err)
 	}
 	defer w.Stop()
+	if r.Config.Sandbox.Warm.Enabled {
+		// The refill loop shares the activities' pool store and is woken by
+		// every claim; it stops with the worker. Pool members outlive a
+		// restart and are reaped by age.
+		poolCtx, stopPool := context.WithCancel(ctx)
+		defer stopPool()
+		go NewWarmPoolService(acts).Run(poolCtx, warmRefillInterval)
+	}
 	select {
 	case <-ctx.Done():
 		return nil

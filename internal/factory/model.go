@@ -290,6 +290,7 @@ const (
 	ArtifactAgentPrompt        = "agent/prompt.txt"
 	ArtifactVerificationResult = "verification/result.json"
 	ArtifactBaseline           = "baseline.json"
+	ArtifactPreparation        = "preparation.json"
 	// ArtifactAudit is the append-only audit trail for operator actions that
 	// touch a live sandbox (attach, preview). It exists because those actions
 	// are privileged and must be attributable after the fact.

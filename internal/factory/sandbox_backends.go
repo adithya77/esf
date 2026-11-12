@@ -37,6 +37,10 @@ type sandboxBackend struct {
 	// networkControl reports that sandboxes implement sandbox.NetworkUpdater
 	// with proxy-side credential injection.
 	networkControl bool
+	// warmPool reports that a live sandbox can be relabelled and re-policed
+	// (sandbox.MetadataUpdater plus NetworkUpdater), which handing a pooled
+	// sandbox to a run requires.
+	warmPool bool
 }
 
 var sandboxBackends = map[string]sandboxBackend{
@@ -108,6 +112,7 @@ var sandboxBackends = map[string]sandboxBackend{
 			return "region " + c.Baseten.Region + " has the egress proxy, template " + c.Baseten.Template
 		},
 		networkControl: true,
+		warmPool:       true,
 	},
 }
 

@@ -65,6 +65,7 @@ data_dir = "/var/lib/esf/factory"
 
 [sandbox]
 # provider = "cubesandbox"  # or "baseten"; see [baseten] above
+
 # Use a versioned Cube template with pinned Git, CA certificates, sha256sum,
 # head, mkfifo, and the configured agent binaries. Empty avoids network package
 # installation for every run. A development template may opt in to packages.
@@ -73,6 +74,17 @@ base_packages = []
 # deny-by-default. Add only destinations the agent genuinely needs at runtime.
 # The model endpoint is allowed automatically by its L7 injection rule.
 runtime_allow_out = []
+
+# Keep prepared sandboxes ready per repository (Baseten only). This table must
+# follow the [sandbox] keys above. See docs/warm-pool.md.
+# [sandbox.warm]
+# enabled         = false
+# size            = 2
+# max_age         = "1h"
+# prepare_command = []
+# [[sandbox.warm.repositories]]
+# local_path = "/srv/esf/fixtures/factory-e2e"
+# ref        = "HEAD"
 
 [limits]
 command_output_bytes = 4194304

@@ -74,11 +74,15 @@ type workflowState struct {
 	createAttempted bool
 	totalTimedOut   bool
 
-	validate          ValidateOutput
-	intake            *IntakeResult
-	resources         ResolvedResources
-	baseline          repository.Baseline
-	sandboxID         string
+	validate  ValidateOutput
+	intake    *IntakeResult
+	resources ResolvedResources
+	baseline  repository.Baseline
+	sandboxID string
+	// warm is the pool claim when the sandbox came from the warm pool, and
+	// acquire how long creating or claiming it took.
+	warm              *WarmClaim
+	acquire           time.Duration
 	template          string
 	harnessVer        string
 	inventoryPath     string
@@ -350,18 +354,25 @@ func (s *workflowState) run(ctx workflow.Context, acts *Activities, req RunReque
 	}
 	var created CreateSandboxOutput
 	if err := executeActivity(ctx, acts.CreateSandbox, infraRetry(), CreateSandboxInput{
-		ExecutionID: s.executionID,
-		RunID:       req.RunID,
-		Template:    template,
-		Harness:     req.AgentHarness,
-		IdleTimeout: req.TotalTimeout,
-		Network:     s.resources.Egress,
+		ExecutionID:   s.executionID,
+		RunID:         req.RunID,
+		Template:      template,
+		Harness:       req.AgentHarness,
+		IdleTimeout:   req.TotalTimeout,
+		Network:       s.resources.Egress,
+		Repository:    req.Repository,
+		LocalPath:     req.LocalPath,
+		RepositoryDir: req.EffectiveRepositoryDir(),
+		Revision:      req.Revision,
+		BasePackages:  s.resources.WorkspaceConfig.BasePackages,
+		SetupScript:   s.resources.WorkspaceConfig.SetupScript,
 	}).Get(ctx, &created); err != nil {
 		s.status.State = StateInfrastructureFailed
 		s.setCondition(ctx, ConditionSandboxReady, ConditionFalse, "CreateFailed", err.Error())
 		return fmt.Errorf("create sandbox: %w", err)
 	}
 	s.sandboxID = created.SandboxID
+	s.warm, s.acquire = created.Warm, created.Duration
 	s.template = created.Template
 	s.status.SandboxID = created.SandboxID
 	s.setCondition(ctx, ConditionSandboxReady, ConditionTrue, "Created",
@@ -377,6 +388,7 @@ func (s *workflowState) run(ctx workflow.Context, acts *Activities, req RunReque
 		BasePackages:      s.resources.WorkspaceConfig.BasePackages,
 		SetupScript:       s.resources.WorkspaceConfig.SetupScript,
 		WorkspaceResolved: true,
+		Warm:              s.warm != nil,
 		ModelEndpoint: agentharness.ModelEndpoint{
 			Provider:  s.resources.ModelProvider,
 			Model:     s.resources.ModelID,
@@ -396,10 +408,12 @@ func (s *workflowState) run(ctx workflow.Context, acts *Activities, req RunReque
 	s.status.CurrentStep = "repo.prepare"
 	var preparedRepo PrepareRepositoryOutput
 	if err := executeActivity(ctx, acts.PrepareRepository, infraRetry(), PrepareRepositoryInput{
-		RunID:     req.RunID,
-		SandboxID: s.sandboxID,
-		Request:   req,
-		Network:   s.resources.Egress,
+		RunID:           req.RunID,
+		SandboxID:       s.sandboxID,
+		Request:         req,
+		Network:         s.resources.Egress,
+		Warm:            s.warm,
+		AcquireDuration: s.acquire,
 	}).Get(ctx, &preparedRepo); err != nil {
 		s.status.State = StateInfrastructureFailed
 		s.setCondition(ctx, ConditionRepositoryPrepared, ConditionFalse, "PrepareFailed", err.Error())

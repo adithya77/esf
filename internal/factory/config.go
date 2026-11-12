@@ -114,6 +114,9 @@ type SandboxConfig struct {
 	// run's sandbox through the deployment ingress. Default closed.
 	AllowPreview bool `toml:"allow_preview"`
 
+	// Warm keeps prepared sandboxes ready per repository. Off by default.
+	Warm WarmPoolConfig `toml:"warm"`
+
 	// RuntimeAllowOut lists additional destinations an agent may reach after
 	// repository preparation. Egress-managed harnesses otherwise receive only
 	// their configured model endpoint under a deny-by-default policy.
@@ -413,18 +416,10 @@ func (c Config) Validate() error {
 		// A credentialed clone restores the run's egress policy afterwards,
 		// so every policy a run can resolve must be stated, not "the
 		// deployment default".
-		for name, policy := range c.Egress {
-			if policy.AllowInternet == nil {
-				problems = append(problems, fmt.Sprintf("repositories.github_token_file: egress policy %q must set allow_internet", name))
-			}
-		}
-		if c.Hardening.AcknowledgeOpenEgress {
-			for name, scope := range c.Scopes {
-				if strings.TrimSpace(scope.Egress) == "" {
-					problems = append(problems, fmt.Sprintf("repositories.github_token_file: scope %q must name an egress policy (open egress is acknowledged, so it would otherwise run under the unstated deployment default)", name))
-				}
-			}
-		}
+		problems = append(problems, c.requireStatedEgress("repositories.github_token_file")...)
+	}
+	if c.Sandbox.Warm.Enabled {
+		problems = append(problems, c.validateWarmPool(backend)...)
 	}
 	if c.SchemaVersion != 0 && c.SchemaVersion != ConfigSchemaVersion {
 		problems = append(problems, fmt.Sprintf("unsupported configuration schema_version %d (supported: %d)", c.SchemaVersion, ConfigSchemaVersion))

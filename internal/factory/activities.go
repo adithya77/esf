@@ -146,6 +146,10 @@ type Activities struct {
 	telemetry       *Telemetry
 	cfg             Config
 	log             *slog.Logger
+	// warm is the pool store when sandbox.warm is enabled; warmRefill wakes
+	// the refill loop after a claim.
+	warm       *warmPool
+	warmRefill chan struct{}
 }
 
 // ActivitiesOptions configures the activity set.
@@ -187,7 +191,16 @@ func NewActivities(opts ActivitiesOptions) (*Activities, error) {
 			return nil, err
 		}
 	}
+	var warm *warmPool
+	if opts.Config.Sandbox.Warm.Enabled {
+		var err error
+		if warm, err = newWarmPool(opts.Config.Storage.DataDir); err != nil {
+			return nil, err
+		}
+	}
 	return &Activities{
+		warm:            warm,
+		warmRefill:      make(chan struct{}, 1),
 		provider:        opts.Provider,
 		repos:           opts.Repositories,
 		harnesses:       opts.Harnesses,
@@ -240,6 +253,17 @@ type CreateSandboxInput struct {
 	Network sandbox.Network `json:"network,omitempty"`
 	// Env is operator-approved environment injected at creation.
 	Env map[string]string `json:"env,omitempty"`
+	// Repository and LocalPath identify the run's repository, so a warm
+	// pooled sandbox for it can be claimed instead of creating one.
+	Repository string `json:"repository,omitempty"`
+	LocalPath  string `json:"local_path,omitempty"`
+	// RepositoryDir, BasePackages and SetupScript are the run's resolved
+	// preparation; a pooled sandbox is used only when they match how pool
+	// members are prepared.
+	RepositoryDir string   `json:"repository_dir,omitempty"`
+	Revision      string   `json:"revision,omitempty"`
+	BasePackages  []string `json:"base_packages,omitempty"`
+	SetupScript   string   `json:"setup_script,omitempty"`
 }
 
 // CreateSandboxOutput identifies the created sandbox.
@@ -247,6 +271,8 @@ type CreateSandboxOutput struct {
 	SandboxID string        `json:"sandbox_id"`
 	Template  string        `json:"template"`
 	Duration  time.Duration `json:"duration"`
+	// Warm is set when the sandbox came from the warm pool.
+	Warm *WarmClaim `json:"warm,omitempty"`
 }
 
 // PrepareSandboxInput provisions the coding agent into the sandbox.
@@ -263,6 +289,9 @@ type PrepareSandboxInput struct {
 	// WorkspaceResolved distinguishes a deliberately empty resolved value from
 	// an older activity payload that predates declarative resources.
 	WorkspaceResolved bool `json:"workspace_resolved,omitempty"`
+	// Warm reports a pooled sandbox: it already ran these base packages and
+	// this setup script (the claim checked), so they are not run again.
+	Warm bool `json:"warm,omitempty"`
 	// ModelEndpoint is the non-secret endpoint configuration resolved during
 	// validation. Credential values remain on the activity worker.
 	ModelEndpoint agentharness.ModelEndpoint `json:"model_endpoint,omitempty"`
@@ -282,6 +311,12 @@ type PrepareRepositoryInput struct {
 	// Network is the run's sandbox egress policy. A credentialed clone
 	// replaces it for the fetch and restores it afterwards.
 	Network sandbox.Network `json:"network,omitempty"`
+	// Warm is set when the sandbox came from the warm pool: the repository is
+	// already there at Warm.Base and only needs moving to the revision.
+	Warm *WarmClaim `json:"warm,omitempty"`
+	// AcquireDuration is how long creating or claiming the sandbox took,
+	// recorded with the preparation evidence.
+	AcquireDuration time.Duration `json:"acquire_duration,omitempty"`
 }
 
 // PrepareRepositoryOutput records the baseline.
@@ -636,7 +671,11 @@ func (a *Activities) CreateSandbox(ctx context.Context, in CreateSandboxInput) (
 		if owned[0].Template != template {
 			return CreateSandboxOutput{}, fmt.Errorf("recovered sandbox template does not match")
 		}
-		return CreateSandboxOutput{SandboxID: owned[0].ID, Template: owned[0].Template}, nil
+		claim, err := a.recoverWarm(ctx, owned[0], in.Network)
+		if err != nil {
+			return CreateSandboxOutput{}, err
+		}
+		return CreateSandboxOutput{SandboxID: owned[0].ID, Template: owned[0].Template, Warm: claim}, nil
 	}
 	if attemptFromContext(ctx) > 1 {
 		return CreateSandboxOutput{}, fmt.Errorf("previous sandbox create is unresolved; refusing duplicate creation")
@@ -644,6 +683,10 @@ func (a *Activities) CreateSandbox(ctx context.Context, in CreateSandboxInput) (
 
 	if idleLimit := a.cfg.Limits.SandboxIdleTimeout.Std(); idleLimit > 0 && (spec.IdleTimeout <= 0 || spec.IdleTimeout > idleLimit) {
 		spec.IdleTimeout = idleLimit
+	}
+	if out, ok := a.claimWarm(ctx, in, spec); ok {
+		span.SetAttributes(attribute.String(AttrSandboxID, out.SandboxID), attribute.Bool("sandbox.warm", true))
+		return out, nil
 	}
 	started := time.Now()
 	sb, err := a.provider.Create(ctx, spec)
@@ -695,6 +738,9 @@ func (a *Activities) PrepareSandbox(ctx context.Context, in PrepareSandboxInput)
 	} else if len(in.BasePackages) > 0 {
 		basePackages = in.BasePackages
 	}
+	if in.Warm {
+		basePackages = nil
+	}
 	if err := installBasePackages(ctx, sb, basePackages, a.log); err != nil {
 		span.RecordError(err)
 		return PrepareSandboxOutput{}, err
@@ -707,6 +753,9 @@ func (a *Activities) PrepareSandbox(ctx context.Context, in PrepareSandboxInput)
 		setupScript = in.SetupScript
 	} else if strings.TrimSpace(in.SetupScript) != "" {
 		setupScript = in.SetupScript
+	}
+	if in.Warm {
+		setupScript = ""
 	}
 	if script := strings.TrimSpace(setupScript); script != "" {
 		exec, err := sb.Execute(ctx, sandbox.Command{
@@ -776,8 +825,14 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 		Revision:  in.Request.Revision,
 		DestDir:   in.Request.EffectiveRepositoryDir(),
 	}
+	started := time.Now()
 	var baseline repository.Baseline
-	if req.Kind == repository.SourceRemote {
+	evidence := Preparation{Path: "cold", AcquireDuration: in.AcquireDuration}
+	if in.Warm != nil {
+		evidence.Path = "warm"
+		evidence.Warm = in.Warm
+		baseline, err = a.updateWarmRepository(ctx, sb, req, in.Network, in.Warm, &evidence)
+	} else if req.Kind == repository.SourceRemote {
 		baseline, err = a.prepareRemoteRepository(ctx, sb, req, in.Network)
 	} else {
 		baseline, err = a.repos.Prepare(ctx, sb, req)
@@ -786,6 +841,8 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 		span.RecordError(err)
 		return PrepareRepositoryOutput{}, err
 	}
+	evidence.RepositoryDuration = time.Since(started)
+	evidence.TransferredBytes = baseline.SnapshotBytes
 	span.SetAttributes(attribute.String("repository.sha", baseline.SHA))
 
 	store, err := a.artifactFactory.ForRun(in.RunID)
@@ -793,6 +850,9 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 		return PrepareRepositoryOutput{}, err
 	}
 	if err := a.writeJSON(store, ArtifactBaseline, baseline); err != nil {
+		return PrepareRepositoryOutput{}, err
+	}
+	if err := a.writeJSON(store, ArtifactPreparation, evidence); err != nil {
 		return PrepareRepositoryOutput{}, err
 	}
 	// git-before.txt answers "what exact code did the agent start from?" in the
@@ -816,6 +876,14 @@ func (a *Activities) PrepareRepository(ctx context.Context, in PrepareRepository
 // activity fails rather than leave the credential route in place while
 // repository or agent code runs.
 func (a *Activities) prepareRemoteRepository(ctx context.Context, sb sandbox.Sandbox, req repository.Request, restore sandbox.Network) (repository.Baseline, error) {
+	return a.withRepositoryCredential(ctx, sb, req, restore, func(req repository.Request) (repository.Baseline, error) {
+		return a.repos.Prepare(ctx, sb, req)
+	})
+}
+
+// withRepositoryCredential runs fetch with the repository's proxy-injected
+// credential in place when one applies, and withdraws it afterwards.
+func (a *Activities) withRepositoryCredential(ctx context.Context, sb sandbox.Sandbox, req repository.Request, restore sandbox.Network, fetch func(repository.Request) (repository.Baseline, error)) (repository.Baseline, error) {
 	// Policy is checked before any credential is read or sent.
 	if err := a.repos.Validate(req); err != nil {
 		return repository.Baseline{}, err
@@ -825,7 +893,7 @@ func (a *Activities) prepareRemoteRepository(ctx context.Context, sb sandbox.San
 		return repository.Baseline{}, err
 	}
 	if !credentialed {
-		return a.repos.Prepare(ctx, sb, req)
+		return fetch(req)
 	}
 	a.redactor.Add(secrets...)
 	// The run's policy is put back afterwards, so it must be stated. "The
@@ -845,7 +913,7 @@ func (a *Activities) prepareRemoteRepository(ctx context.Context, sb sandbox.San
 	var prepErr error
 	if applyErr == nil {
 		req.Shallow = true
-		baseline, prepErr = a.repos.Prepare(ctx, sb, req)
+		baseline, prepErr = fetch(req)
 	}
 	// Restore on every path, including a failed apply: a provider can report
 	// an error after the credential route is already live. The activity may
