@@ -201,14 +201,21 @@ func (s *ChangeStore) lockChange(changeID string) (func(), error) {
 	if _, err := s.pathFor(changeID); err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(s.root)
+	return lockFileIn(s.root, changeID+".lock")
+}
+
+// lockFileIn takes an exclusive flock on dir/name, creating it if needed,
+// and returns the release function. It is how the factory's JSON stores
+// serialise read/modify/write across activities and processes on one host.
+func lockFileIn(dir, name string) (func(), error) {
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 	var lock *os.File
 	for attempt := 0; ; attempt++ {
-		lock, err = root.OpenFile(changeID+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
+		lock, err = root.OpenFile(name, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 		if err == nil || !errors.Is(err, os.ErrNotExist) || attempt == 4 {
 			break
 		}
