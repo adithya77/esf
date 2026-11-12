@@ -13,6 +13,7 @@ Start with the [factory overview](FACTORY.md), then use the
 - [Development](development.md)
 - [Cube local routing](cube-local-routing.md)
 - [Baseten Sandboxes provider](baseten.md)
+- [Private and large repositories](private-repositories.md)
 - [Optional issue-triage demo](issue-triage-demo.md)
 
 ## Harnesses and execution
