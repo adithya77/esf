@@ -90,6 +90,83 @@ deployment that needs the whole image pinned should build its own
 ([Baseten](https://docs.baseten.co/sandboxes/manage-images.md)) from a
 digest-pinned base, as with a versioned Cube template.
 
+## Pi on a Baseten model
+
+The Pi harness runs on Baseten with a Baseten-hosted model, and the model key
+never enters the sandbox: the egress proxy injects it on
+`inference.baseten.co` only.
+
+### The image
+
+`deploy/baseten/Dockerfile.pi` builds the sandbox image. Every input is pinned
+by digest: Debian 13, the Blaxel sandbox API, and Node 26.13.0. Pi's runner
+and runtime hashes match `agents/pi/inventory.json`, and
+`scripts/verify-pi-inventory.py` checks them. It adds git, Python and curl. It
+runs commands as uid 10001 (`agent`), so `hardening.require_non_root = true`
+passes. It sets `NODE_USE_ENV_PROXY=1`: Blaxel routes all egress through its
+proxy, and Node's `fetch` ignores `HTTPS_PROXY` without it, so every model
+request would otherwise time out.
+
+```sh
+scripts/build-baseten-pi-image.sh esf-pi   # prints the immutable version tag
+```
+
+The script uploads only the Dockerfile and the committed Pi bundle, builds on
+Baseten, and prints the version tags. Baseten assigns a content-addressed tag
+per build; pin it, never `latest`.
+
+### Configuration
+
+```toml
+[sandbox]
+provider      = "baseten"
+base_packages = []
+
+[baseten]
+api_key_file = "/etc/factory/baseten-api-key"
+region       = "us-pdx-1"
+template     = "sandbox/esf-pi:b242d6a510e452ed1aca3"
+memory_mib   = 4096
+
+[harnesses.pi]
+type                 = "pi"
+preinstalled         = true
+binary               = "/opt/esf/agents/pi-runner.mjs"
+binary_sha256        = "2f2b5191139a564050c98f0784e9be63893d47685abc6ac8a4049a942b201993"
+runtime_binary       = "/opt/esf/agents/node"
+runtime_sha256       = "0adde40d1b7dfa57c8bc83cbc319758c3ec6ebba21363bb2fa752ea6b267ad1b"
+provider             = "baseten"
+base_url             = "https://inference.baseten.co/v1"
+model                = "deepseek-ai/DeepSeek-V4.1-Flash"
+api                  = "openai-completions"
+thinking_level       = "off"
+max_process_restarts = 1
+api_key_file         = "/etc/factory/baseten-api-key"
+credential_mode      = "cube_egress"
+timeout              = "20m"
+
+[egress.locked]
+allow_internet = false
+
+[scopes.default]
+egress = "locked"
+
+[hardening]
+require_non_root = true
+```
+
+The model is in Pi's embedded catalog, with context limits and pricing, so
+no `catalog_cache` is needed. After repository preparation, the runtime policy
+allows only `POST inference.baseten.co/v1/*` and injects
+`Authorization: Bearer <key>` there. Pi sees the placeholder.
+
+On 2026-11-12, run `run-312f2e7d15aa74d46e3503f3` completed a real task on
+the fixture repository. It changed the greeting and added `farewell()` with a
+test. Verification passed, the review gate approved it, and cleanup was
+verified. The agent took 8.0 s, using 13,830 input tokens (6,656 cached) and
+955 output tokens: about $0.0033 at catalog prices, an estimate rather than an
+invoice. The agent ran as uid 10001.
+
 ## Egress policy mapping
 
 | Factory policy | Blaxel proxy |
@@ -125,10 +202,11 @@ as strictly as requested:
   refused CONNECT (with curl) or an unreachable network (without), which the
   probe records as undecided. It never reports a false "blocked", and a
   reachable canary still fails the run.
-- **Sandboxes run as root** in the public images. Non-root needs a custom image
-  with `USER` and `BL_SANDBOX_USER_ENABLED=true`
-  ([Blaxel](https://docs.blaxel.ai/Sandboxes/Non-root-user)); until then,
-  `hardening.require_non_root = true` fails the run.
+- **Sandboxes run as root** in the public images. The ESF Pi image
+  (`deploy/baseten/Dockerfile.pi`) runs as uid 10001 with
+  `BL_SANDBOX_USER_ENABLED=true`
+  ([Blaxel](https://docs.blaxel.ai/Sandboxes/Non-root-user)), so
+  `hardening.require_non_root = true` passes on it.
 - **`base_packages` cannot install under a locked policy.** `apt-get update`
   exits zero when every fetch fails, so the install only succeeds when the
   packages are already in the image. Set `base_packages = []` and use an image
